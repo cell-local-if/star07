@@ -55,7 +55,12 @@ class Reservation:
     reservation_id: str
     key: str
     cost: int
-    rolled_back: bool = False
+    created_at: float
+    ttl_seconds: int
+    settled: bool = False
+
+    def expires_at(self) -> float:
+        return self.created_at + self.ttl_seconds
 
 
 def validate_key(key: Any) -> str:
@@ -68,6 +73,17 @@ def validate_cost(cost: Any) -> int:
     if not isinstance(cost, int) or isinstance(cost, bool) or cost < 1 or cost > 1_000_000:
         raise InvalidRequest("cost must be an integer between 1 and 1000000")
     return cost
+
+
+DEFAULT_TTL_SECONDS = 60
+MAX_TTL_SECONDS = 86400
+
+
+def validate_ttl_seconds(ttl_seconds: Any) -> int:
+    if (not isinstance(ttl_seconds, int) or isinstance(ttl_seconds, bool)
+            or ttl_seconds < 1 or ttl_seconds > MAX_TTL_SECONDS):
+        raise InvalidRequest(f"ttl_seconds must be an integer between 1 and {MAX_TTL_SECONDS}")
+    return ttl_seconds
 
 
 def validate_limit(payload: Any) -> Limit:
@@ -98,6 +114,11 @@ class Limiter:
         key = validate_key(key)
         limit = validate_limit(payload)
         with self._lock:
+            if key in self._limits:
+                # Reconfigure is a settlement point: release this key's expired reservations
+                # under the current limit before the new one takes over. Live reservations
+                # stay valid and keep their original expiry.
+                self._settle_expired(key)
             self._limits[key] = limit
             existing = self._buckets.get(key)
             self._buckets[key] = Bucket(limit.capacity if existing is None else min(existing.tokens, limit.capacity),
@@ -119,10 +140,29 @@ class Limiter:
         self._buckets[key] = bucket
         return bucket
 
+    def _settle_expired(self, key: str) -> None:
+        """Lazily release this key's expired reservations. Lock must be held and `key` configured.
+
+        Refills by elapsed time first, then returns each expired reservation's cost exactly
+        once, capped at the key's current capacity. A reservation expires when the monotonic
+        clock reaches created_at + ttl_seconds (boundary inclusive).
+        """
+        now = self._now()
+        expired = [reservation for reservation in self._reservations.values()
+                   if reservation.key == key and not reservation.settled and now >= reservation.expires_at()]
+        if not expired:
+            return
+        limit = self._limits[key]
+        bucket = self._refill(key)
+        for reservation in expired:
+            reservation.settled = True
+            bucket.tokens = min(float(limit.capacity), bucket.tokens + reservation.cost)
+
     def check(self, key: Any, cost: Any) -> dict[str, Any]:
         cost = validate_cost(cost)
         with self._lock:
             limit = self.limit(key)
+            self._settle_expired(key)
             bucket = self._refill(key)
             if bucket.tokens >= cost:
                 bucket.tokens -= cost
@@ -132,29 +172,40 @@ class Limiter:
             retry_after = deficit / limit.refill_per_second
             raise OverQuota(f"key {key!r} has {bucket.tokens:.3f} tokens, needs {cost}", retry_after)
 
-    def reserve(self, key: Any, cost: Any) -> dict[str, Any]:
-        """Atomically hold `cost` tokens, exactly as check() judges them, without booking them as used."""
+    def reserve(self, key: Any, cost: Any, ttl_seconds: Any = DEFAULT_TTL_SECONDS) -> dict[str, Any]:
+        """Atomically hold `cost` tokens, exactly as check() judges them, without booking them as used.
+
+        The hold expires `ttl_seconds` after creation and is then released lazily.
+        """
         validate_key(key)
         cost = validate_cost(cost)
+        ttl_seconds = validate_ttl_seconds(ttl_seconds)
         with self._lock:
             limit = self.limit(key)
+            self._settle_expired(key)
             bucket = self._refill(key)
             if bucket.tokens < cost:
                 deficit = cost - bucket.tokens
                 raise OverQuota(f"key {key!r} has {bucket.tokens:.3f} tokens, needs {cost}",
                                 deficit / limit.refill_per_second)
             bucket.tokens -= cost
-            reservation = Reservation(uuid.uuid4().hex, key, cost)
+            reservation = Reservation(uuid.uuid4().hex, key, cost, self._now(), ttl_seconds)
             self._reservations[reservation.reservation_id] = reservation
             return {"reservation_id": reservation.reservation_id, "key": key, "cost": cost,
-                    "remaining": int(bucket.tokens), "capacity": limit.capacity}
+                    "remaining": int(bucket.tokens), "capacity": limit.capacity,
+                    "ttl_seconds": ttl_seconds}
 
     def rollback(self, reservation_id: str) -> dict[str, Any]:
         with self._lock:
             reservation = self._reservations.get(reservation_id)
-            if reservation is None or reservation.rolled_back:
+            if reservation is None:
                 raise LimitNotFound(f"no rollbackable reservation {reservation_id!r}")
-            reservation.rolled_back = True
+            # Rolling back is a settlement point for the reservation's key: an already
+            # expired reservation is released here and can no longer be rolled back.
+            self._settle_expired(reservation.key)
+            if reservation.settled:
+                raise LimitNotFound(f"no rollbackable reservation {reservation_id!r}")
+            reservation.settled = True
             key = reservation.key
             limit = self._limits[key]
             bucket = self._refill(key)
@@ -165,6 +216,7 @@ class Limiter:
     def state(self, key: str) -> dict[str, Any]:
         with self._lock:
             limit = self.limit(key)
+            self._settle_expired(key)
             bucket = self._refill(key)
             return {"limit": limit.as_json(), "remaining": int(bucket.tokens), "used": sum(bucket.cost_history)}
 
@@ -243,10 +295,12 @@ def make_handler(limiter: Limiter) -> type[BaseHTTPRequestHandler]:
                     return self._send(200, result)
                 if parts == ["v1", "reservations"]:
                     body = self._read_json()
-                    if not isinstance(body, dict) or set(body) - {"key", "cost"}:
-                        raise InvalidRequest("body must be {\"key\": <string>, \"cost\": <integer>}")
+                    if not isinstance(body, dict) or set(body) - {"key", "cost", "ttl_seconds"}:
+                        raise InvalidRequest("body must be {\"key\": <string>, \"cost\": <integer>, "
+                                             "\"ttl_seconds\": <integer 1..86400>?}")
                     try:
-                        result = limiter.reserve(body.get("key"), body.get("cost", 1))
+                        result = limiter.reserve(body.get("key"), body.get("cost", 1),
+                                                 body.get("ttl_seconds", DEFAULT_TTL_SECONDS))
                     except OverQuota as error:
                         # Round up to the millisecond so the value is always long enough to refill `cost`.
                         retry_after = math.ceil(error.retry_after * 1000) / 1000
