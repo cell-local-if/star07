@@ -31,6 +31,18 @@ PYTHONPATH=src python3 -m unittest discover -s tests -v
 
 ### `GET /v1/limits/{key}`
 `200 {"limit": {...}, "remaining": <int>, "used": <int>}`（读取也会先按时间补充，体现当前余量）。
+`used` 只累计 `check` 已接受的消耗，不受预留/回滚影响。
+
+### `POST /v1/reservations`
+请求体同 `check`：`{"key": <string>, "cost": <int ≥1，缺省 1>}`。
+- 成功：`200 {"reservation_id": <进程内唯一不透明字符串>, "key", "cost", "remaining", "capacity}`，
+  并立即原子扣减令牌（与 `check` 共用同一把锁，并发不超卖）；查询该 key 的 `remaining` 立即反映扣减。
+- 错误语义与 `check` 一致：非法 key/cost ⇒ `400`，未配置 key ⇒ `404`，令牌不足 ⇒ `429` + `Retry-After`。
+
+### `DELETE /v1/reservations/{reservation_id}`
+- 成功：`200 {"reservation_id", "rolled_back": true, "remaining", "capacity}`；
+  把预留的 `cost` 放回该 key 当前桶，按**当前** capacity 封顶（预留期间重新配置不影响回滚）。
+- 同一预留只能回滚一次：重复撤销、未知 id、路径不匹配 ⇒ `404 not_found`。
 
 ## 错误语义
 
@@ -42,5 +54,5 @@ PYTHONPATH=src python3 -m unittest discover -s tests -v
 
 ## 未实现（后续任务候选，非固定题单）
 
-滑动窗口/漏桶、分层配额与预占回滚、跨实例一致、热点键、降级与熔断、配额账本与计费对账、配置热更新的原子切换、
+滑动窗口/漏桶、分层配额、跨实例一致、热点键、降级与熔断、配额账本与计费对账、配置热更新的原子切换、
 时钟偏斜处理、可观测性与压测基线。

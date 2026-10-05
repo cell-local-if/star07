@@ -8,10 +8,12 @@ from .app import (  # noqa: F401
     Limiter,
     OverQuota,
     QuotaError,
+    Reservation,
+    ReservationNotFound,
     make_handler,
     serve,
     validate_limit,
 )
 
 __all__ = ["Bucket", "InvalidRequest", "Limit", "LimitNotFound", "Limiter", "OverQuota", "QuotaError",
-           "make_handler", "serve", "validate_limit"]
+           "Reservation", "ReservationNotFound", "make_handler", "serve", "validate_limit"]
