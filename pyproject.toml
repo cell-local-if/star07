@@ -1,0 +1,13 @@
+[project]
+name = "quota-service"
+version = "0.1.0"
+description = "Multi-tenant token-bucket rate limiting service (stdlib only)"
+requires-python = ">=3.12"
+dependencies = []
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
