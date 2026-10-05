@@ -24,13 +24,29 @@ PYTHONPATH=src python3 -m unittest discover -s tests -v
 - 未知字段/非法值 ⇒ `400 invalid_request`。
 
 ### `POST /v1/check`
-请求体：`{"key": <string>, "cost": <int ≥1，缺省 1>}`
+请求体：`{"key": <string>, "cost": <int 1..1000000，缺省 1>}`
 - 允许：`200 {"allowed": true, "remaining": <int 向下取整>, "capacity": <int>}`（并扣减令牌）。
 - 超限：**`429`** `{"error":{"code":"over_quota",...}}`，并带 **`Retry-After`**（秒，浮点，够补足 `cost` 的时间）。
-- 未配置的 key ⇒ `404 not_found`；`cost` 非法 ⇒ `400 invalid_request`。
+- 未配置的 key ⇒ `404 not_found`；`cost` 非法（含布尔值）⇒ `400 invalid_request`。
+
+### `POST /v1/reservations`
+预留（占用但不记为已消耗）。请求体与检查接口同语义：`{"key": <string 非空 ≤200 字符>, "cost": <int 1..1000000，缺省 1>}`。
+- 成功：`200 {"reservation_id": <进程内唯一的不透明字符串>, "key": ..., "cost": <int>, "remaining": <int>, "capacity": <int>}`。
+  预留立即扣减桶内令牌，`GET /v1/limits/{key}` 的 `remaining` 立即反映扣减，但 **`used` 不变**（`used` 只统计已接受的即时消耗）。
+- 与 `check` 共用同一把锁、同一套原子额度判断：并发的检查与预留不会超卖。
+- 未配置的 key ⇒ `404 not_found`；key/cost 非法（含布尔值）⇒ `400 invalid_request`。
+- 令牌不足 ⇒ `429 over_quota` 并带 **`Retry-After`**（秒，浮点；按当前 `refill_per_second` 计算并向上取整到毫秒，至少足够补足本次 `cost`）。
+
+### `DELETE /v1/reservations/{reservation_id}`
+对尚可回滚的预留执行**一次**撤销：把预留扣掉的 `cost` 放回该 key 当前桶，并按当前 `capacity` 封顶（返还前也先按时间补充）。
+- 成功：`200 {"reservation_id": ..., "rolled_back": true, "remaining": <int>, "capacity": <int>}`；
+  返还后 `remaining` 立即反映且不超过 `capacity`。
+- 重复撤销、未知预留、路径不匹配（段数不对/别的资源）⇒ `404 not_found`。
+- 预留期间允许继续检查与重新配置同一 key；重新配置仍保留已用额度（`min(旧令牌, 新 capacity)`）并采用新容量与补充速率，
+  预留占用的额度在重配前后都被保留，回滚时返还到按新配置运行的桶中。
 
 ### `GET /v1/limits/{key}`
-`200 {"limit": {...}, "remaining": <int>, "used": <int>}`（读取也会先按时间补充，体现当前余量）。
+`200 {"limit": {...}, "remaining": <int>, "used": <int>}`（读取也会先按时间补充，体现当前余量；未确认的预留不计入 `used`）。
 
 ## 错误语义
 
@@ -42,5 +58,5 @@ PYTHONPATH=src python3 -m unittest discover -s tests -v
 
 ## 未实现（后续任务候选，非固定题单）
 
-滑动窗口/漏桶、分层配额与预占回滚、跨实例一致、热点键、降级与熔断、配额账本与计费对账、配置热更新的原子切换、
-时钟偏斜处理、可观测性与压测基线。
+滑动窗口/漏桶、分层配额、跨实例一致、热点键、降级与熔断、配额账本与计费对账、配置热更新的原子切换、
+预留的自动过期（目前预留长期有效，直到回滚或进程结束）、时钟偏斜处理、可观测性与压测基线。

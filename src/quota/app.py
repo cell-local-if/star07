@@ -5,7 +5,9 @@ Public contract is README.md. Time is injected everywhere so the refill maths is
 from __future__ import annotations
 
 import json
+import math
 import threading
+import uuid
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable
@@ -48,6 +50,26 @@ class Bucket:
     cost_history: list[float] = field(default_factory=list)
 
 
+@dataclass
+class Reservation:
+    reservation_id: str
+    key: str
+    cost: int
+    rolled_back: bool = False
+
+
+def validate_key(key: Any) -> str:
+    if not isinstance(key, str) or not key or len(key) > 200:
+        raise InvalidRequest("key must be a non-empty string of at most 200 characters")
+    return key
+
+
+def validate_cost(cost: Any) -> int:
+    if not isinstance(cost, int) or isinstance(cost, bool) or cost < 1 or cost > 1_000_000:
+        raise InvalidRequest("cost must be an integer between 1 and 1000000")
+    return cost
+
+
 def validate_limit(payload: Any) -> Limit:
     if not isinstance(payload, dict):
         raise InvalidRequest("body must be a JSON object")
@@ -70,10 +92,10 @@ class Limiter:
         self._lock = threading.RLock()
         self._limits: dict[str, Limit] = {}
         self._buckets: dict[str, Bucket] = {}
+        self._reservations: dict[str, Reservation] = {}
 
-    def configure(self, key: str, payload: Any) -> Limit:
-        if not isinstance(key, str) or not key or len(key) > 200:
-            raise InvalidRequest("key must be a non-empty string of at most 200 characters")
+    def configure(self, key: Any, payload: Any) -> Limit:
+        key = validate_key(key)
         limit = validate_limit(payload)
         with self._lock:
             self._limits[key] = limit
@@ -97,9 +119,8 @@ class Limiter:
         self._buckets[key] = bucket
         return bucket
 
-    def check(self, key: str, cost: Any) -> dict[str, Any]:
-        if not isinstance(cost, int) or isinstance(cost, bool) or cost < 1 or cost > 1_000_000:
-            raise InvalidRequest("cost must be an integer between 1 and 1000000")
+    def check(self, key: Any, cost: Any) -> dict[str, Any]:
+        cost = validate_cost(cost)
         with self._lock:
             limit = self.limit(key)
             bucket = self._refill(key)
@@ -110,6 +131,36 @@ class Limiter:
             deficit = cost - bucket.tokens
             retry_after = deficit / limit.refill_per_second
             raise OverQuota(f"key {key!r} has {bucket.tokens:.3f} tokens, needs {cost}", retry_after)
+
+    def reserve(self, key: Any, cost: Any) -> dict[str, Any]:
+        """Atomically hold `cost` tokens, exactly as check() judges them, without booking them as used."""
+        validate_key(key)
+        cost = validate_cost(cost)
+        with self._lock:
+            limit = self.limit(key)
+            bucket = self._refill(key)
+            if bucket.tokens < cost:
+                deficit = cost - bucket.tokens
+                raise OverQuota(f"key {key!r} has {bucket.tokens:.3f} tokens, needs {cost}",
+                                deficit / limit.refill_per_second)
+            bucket.tokens -= cost
+            reservation = Reservation(uuid.uuid4().hex, key, cost)
+            self._reservations[reservation.reservation_id] = reservation
+            return {"reservation_id": reservation.reservation_id, "key": key, "cost": cost,
+                    "remaining": int(bucket.tokens), "capacity": limit.capacity}
+
+    def rollback(self, reservation_id: str) -> dict[str, Any]:
+        with self._lock:
+            reservation = self._reservations.get(reservation_id)
+            if reservation is None or reservation.rolled_back:
+                raise LimitNotFound(f"no rollbackable reservation {reservation_id!r}")
+            reservation.rolled_back = True
+            key = reservation.key
+            limit = self._limits[key]
+            bucket = self._refill(key)
+            bucket.tokens = min(float(limit.capacity), bucket.tokens + reservation.cost)
+            return {"reservation_id": reservation_id, "rolled_back": True,
+                    "remaining": int(bucket.tokens), "capacity": limit.capacity}
 
     def state(self, key: str) -> dict[str, Any]:
         with self._lock:
@@ -184,16 +235,40 @@ def make_handler(limiter: Limiter) -> type[BaseHTTPRequestHandler]:
         def do_POST(self) -> None:  # noqa: N802
             try:
                 parts = self._keys()
-                if parts != ["v1", "check"]:
-                    return self._send(404, {"error": {"code": "not_found"}})
-                body = self._read_json()
-                if not isinstance(body, dict) or set(body) - {"key", "cost"}:
-                    raise InvalidRequest("body must be {\"key\": <string>, \"cost\": <integer>}")
-                result = limiter.check(body.get("key"), body.get("cost", 1))
-                return self._send(200, result)
+                if parts == ["v1", "check"]:
+                    body = self._read_json()
+                    if not isinstance(body, dict) or set(body) - {"key", "cost"}:
+                        raise InvalidRequest("body must be {\"key\": <string>, \"cost\": <integer>}")
+                    result = limiter.check(body.get("key"), body.get("cost", 1))
+                    return self._send(200, result)
+                if parts == ["v1", "reservations"]:
+                    body = self._read_json()
+                    if not isinstance(body, dict) or set(body) - {"key", "cost"}:
+                        raise InvalidRequest("body must be {\"key\": <string>, \"cost\": <integer>}")
+                    try:
+                        result = limiter.reserve(body.get("key"), body.get("cost", 1))
+                    except OverQuota as error:
+                        # Round up to the millisecond so the value is always long enough to refill `cost`.
+                        retry_after = math.ceil(error.retry_after * 1000) / 1000
+                        return self._send(error.status, {"error": {"code": error.code, "message": str(error)}},
+                                          {"Retry-After": f"{retry_after:.3f}"})
+                    return self._send(200, result)
+                return self._send(404, {"error": {"code": "not_found"}})
             except OverQuota as error:
                 return self._send(error.status, {"error": {"code": error.code, "message": str(error)}},
                                   {"Retry-After": f"{error.retry_after:.3f}"})
+            except QuotaError as error:
+                return self._send(error.status, {"error": {"code": error.code, "message": str(error)}})
+            except Exception:
+                return self._send(500, {"error": {"code": "internal_error"}})
+
+        def do_DELETE(self) -> None:  # noqa: N802
+            try:
+                parts = self._keys()
+                if len(parts) != 3 or parts[:2] != ["v1", "reservations"]:
+                    return self._send(404, {"error": {"code": "not_found"}})
+                result = limiter.rollback(parts[2])
+                return self._send(200, result)
             except QuotaError as error:
                 return self._send(error.status, {"error": {"code": error.code, "message": str(error)}})
             except Exception:
