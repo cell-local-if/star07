@@ -107,6 +107,9 @@ class Limiter:
         self._limits: dict[str, Limit] = {}
         self._buckets: dict[str, Bucket] = {}
         self._reservations: dict[str, Reservation] = {}
+        # Confirmed holds leave the active registry for good; the value is the exact first consume
+        # response, replayed verbatim for idempotent retries (used is never booked a second time).
+        self._consumed: dict[str, dict[str, Any]] = {}
 
     def configure(self, key: Any, payload: Any) -> Limit:
         key = validate_key(key)
@@ -215,6 +218,37 @@ class Limiter:
             return {"reservation_id": reservation_id, "rolled_back": True,
                     "remaining": int(bucket.tokens), "capacity": limit.capacity}
 
+    def consume(self, reservation_id: str) -> dict[str, Any]:
+        """Confirm a live hold as real usage.
+
+        Due reservations of the key are refunded first, exactly as every other entry does. The target
+        hold's cost was already taken from the bucket at reserve() time, so here it is booked once into
+        used with no extra deduction and no refund. Repeating the call replays the first response byte
+        for byte and never books used again.
+        """
+        with self._lock:
+            snapshot = self._consumed.get(reservation_id)
+            if snapshot is not None:
+                return dict(snapshot)
+            reservation = self._reservations.get(reservation_id)
+            if reservation is None:
+                raise LimitNotFound(f"no consumable reservation {reservation_id!r}")
+            key = reservation.key
+            # A reservation whose TTL has elapsed is refunded by the existing settle first; the target
+            # is then unknown, consumes nothing and is never booked later.
+            self._expire_due(key)
+            reservation = self._reservations.pop(reservation_id, None)
+            if reservation is None:
+                raise LimitNotFound(f"no consumable reservation {reservation_id!r}")
+            limit = self._limits[key]
+            bucket = self._refill(key)
+            bucket.cost_history.append(reservation.cost)
+            snapshot = {"reservation_id": reservation_id, "consumed": True,
+                        "remaining": int(bucket.tokens), "capacity": limit.capacity,
+                        "used": sum(bucket.cost_history)}
+            self._consumed[reservation_id] = snapshot
+            return dict(snapshot)
+
     def state(self, key: str) -> dict[str, Any]:
         with self._lock:
             limit = self.limit(key)
@@ -308,6 +342,12 @@ def make_handler(limiter: Limiter) -> type[BaseHTTPRequestHandler]:
                         retry_after = math.ceil(error.retry_after * 1000) / 1000
                         return self._send(error.status, {"error": {"code": error.code, "message": str(error)}},
                                           {"Retry-After": f"{retry_after:.3f}"})
+                    return self._send(200, result)
+                if len(parts) == 4 and parts[:2] == ["v1", "reservations"] and parts[3] == "consume":
+                    body = self._read_json()
+                    if not isinstance(body, dict) or body:
+                        raise InvalidRequest('body must be an empty JSON object {}')
+                    result = limiter.consume(parts[2])
                     return self._send(200, result)
                 return self._send(404, {"error": {"code": "not_found"}})
             except OverQuota as error:

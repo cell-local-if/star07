@@ -355,6 +355,186 @@ class ReservationUnitTests(unittest.TestCase):
         self.assertEqual(limiter.state("hot")["remaining"], 0)
 
 
+class ConsumeUnitTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.clock = Clock()
+        self.limiter = Limiter(self.clock)
+        self.limiter.configure("tenant-a", {"capacity": 5, "refill_per_second": 1.0})
+
+    def test_consume_books_cost_once_without_touching_tokens(self) -> None:
+        reservation = self.limiter.reserve("tenant-a", 3)   # tokens 2, used 0
+        result = self.limiter.consume(reservation["reservation_id"])
+        self.assertEqual(result, {"reservation_id": reservation["reservation_id"], "consumed": True,
+                                  "remaining": 2, "capacity": 5, "used": 3})
+        state = self.limiter.state("tenant-a")              # same clock reading: same remaining
+        self.assertEqual((state["remaining"], state["used"]), (2, 3))
+
+    def test_consume_is_idempotent_and_replays_the_first_response(self) -> None:
+        reservation = self.limiter.reserve("tenant-a", 2)
+        first = self.limiter.consume(reservation["reservation_id"])
+        self.clock.t += 3.0                                 # refill would change a fresh answer
+        self.assertTrue(self.limiter.check("tenant-a", 1)["allowed"])  # and later usage would change used
+        second = self.limiter.consume(reservation["reservation_id"])
+        self.assertEqual(second, first)                     # byte-for-byte field values, frozen snapshot
+        state = self.limiter.state("tenant-a")
+        self.assertEqual(state["used"], 3)                  # 2 booked once + 1 instant spend
+
+    def test_consume_settles_due_sibling_reservations_first(self) -> None:
+        limiter = Limiter(self.clock)
+        limiter.configure("frozen", {"capacity": 5, "refill_per_second": 0.0001})
+        due = limiter.reserve("frozen", 2, ttl_seconds=5)   # tokens 3
+        target = limiter.reserve("frozen", 1, ttl_seconds=60)  # tokens 2
+        self.clock.t += 5
+        result = limiter.consume(target["reservation_id"])  # due hold refunds 2 before confirmation
+        self.assertEqual((result["remaining"], result["used"], result["capacity"]), (4, 1, 5))
+        with self.assertRaises(LimitNotFound):
+            limiter.consume(due["reservation_id"])          # settled hold is unknown, never booked
+        self.assertEqual(limiter.state("frozen")["used"], 1)
+
+    def test_consume_at_or_after_expiry_is_404_and_never_books(self) -> None:
+        limiter = Limiter(self.clock)
+        limiter.configure("frozen", {"capacity": 5, "refill_per_second": 0.0001})
+        self.assertTrue(limiter.check("frozen", 2)["allowed"])  # tokens 3, used 2
+        reservation = limiter.reserve("frozen", 2, ttl_seconds=5)  # tokens 1
+        self.clock.t += 5                                   # inclusive boundary
+        with self.assertRaises(LimitNotFound):
+            limiter.consume(reservation["reservation_id"])
+        self.clock.t += 10                                  # never books later either
+        with self.assertRaises(LimitNotFound):
+            limiter.consume(reservation["reservation_id"])
+        state = limiter.state("frozen")                     # 1 + 2 refunded, used stays 2
+        self.assertEqual((state["remaining"], state["used"]), (3, 2))
+
+    def test_consumed_reservation_cannot_roll_back_or_expire(self) -> None:
+        limiter = Limiter(self.clock)
+        limiter.configure("frozen", {"capacity": 4, "refill_per_second": 0.0001})
+        reservation = limiter.reserve("frozen", 3, ttl_seconds=5)  # tokens 1
+        self.assertEqual(limiter.consume(reservation["reservation_id"])["used"], 3)
+        with self.assertRaises(LimitNotFound):
+            limiter.rollback(reservation["reservation_id"])
+        self.clock.t += 10                                  # well past expiry: no refund
+        state = limiter.state("frozen")
+        self.assertEqual((state["remaining"], state["used"]), (1, 3))
+
+    def test_unknown_and_rolled_back_reservations_are_404(self) -> None:
+        with self.assertRaises(LimitNotFound):
+            self.limiter.consume("nope")
+        reservation = self.limiter.reserve("tenant-a", 1)
+        self.limiter.rollback(reservation["reservation_id"])
+        with self.assertRaises(LimitNotFound):
+            self.limiter.consume(reservation["reservation_id"])
+        self.assertEqual(self.limiter.state("tenant-a")["used"], 0)
+
+    def test_consume_after_reconfigure_uses_old_cost_and_new_capacity(self) -> None:
+        reservation = self.limiter.reserve("tenant-a", 4)   # tokens 1
+        self.limiter.configure("tenant-a", {"capacity": 10, "refill_per_second": 2.0})
+        self.clock.t += 1.0                                 # 2 tokens refill at the new rate
+        result = self.limiter.consume(reservation["reservation_id"])
+        self.assertEqual((result["remaining"], result["capacity"], result["used"]), (3, 10, 4))
+        state = self.limiter.state("tenant-a")
+        self.assertEqual((state["remaining"], state["used"]), (3, 4))
+
+    def test_concurrent_consume_and_rollback_have_one_winner_each(self) -> None:
+        limiter = Limiter(self.clock)
+        limiter.configure("hot", {"capacity": 200, "refill_per_second": 0.0001})
+        ids = [limiter.reserve("hot", 1, ttl_seconds=3600)["reservation_id"] for _ in range(200)]
+        consumed: list[str] = []
+        rolled: list[str] = []
+        errors: list[BaseException] = []
+        list_lock = threading.Lock()
+
+        def settle(consume: bool, rid: str) -> None:
+            try:
+                if consume:
+                    result = limiter.consume(rid)
+                    if result["used"] <= 0:
+                        raise AssertionError("consume reported no usage")
+                    winner = consumed
+                else:
+                    limiter.rollback(rid)
+                    winner = rolled
+                with list_lock:
+                    winner.append(rid)
+            except LimitNotFound:
+                pass
+            except BaseException as error:  # noqa: BLE001 - surface thread failures on the main thread
+                errors.append(error)
+
+        threads = []
+        for index, rid in enumerate(ids):
+            threads.append(threading.Thread(target=settle, args=(True, rid)))
+            threads.append(threading.Thread(target=settle, args=(False, rid)))
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(errors, [])
+        self.assertEqual(len(consumed) + len(rolled), 200)
+        self.assertEqual(set(consumed) & set(rolled), set())
+        state = limiter.state("hot")
+        self.assertEqual(state["used"], len(consumed))
+        self.assertEqual(state["remaining"], len(rolled))  # negligible refill, rollback capped at capacity
+        self.assertEqual([r for r in limiter._reservations.values() if r.key == "hot"], [])
+
+    def test_concurrent_duplicate_consumes_book_usage_once(self) -> None:
+        limiter = Limiter(self.clock)
+        limiter.configure("hot", {"capacity": 5, "refill_per_second": 0.0001})
+        rid = limiter.reserve("hot", 3, ttl_seconds=3600)["reservation_id"]
+        responses: list[dict] = []
+        errors: list[BaseException] = []
+
+        def confirm() -> None:
+            try:
+                responses.append(limiter.consume(rid))
+            except BaseException as error:  # noqa: BLE001
+                errors.append(error)
+
+        threads = [threading.Thread(target=confirm) for _ in range(16)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(errors, [])
+        self.assertEqual(len(responses), 16)
+        self.assertTrue(all(response == responses[0] for response in responses))
+        state = limiter.state("hot")
+        self.assertEqual((state["remaining"], state["used"]), (2, 3))
+
+    def test_concurrent_consume_against_expiry_never_refunds_and_books(self) -> None:
+        limiter = Limiter(self.clock)
+        limiter.configure("hot", {"capacity": 10, "refill_per_second": 0.0001})
+        ids = [limiter.reserve("hot", 1, ttl_seconds=10)["reservation_id"] for _ in range(10)]
+        self.clock.t += 10
+        statuses: list[str] = []
+        errors: list[BaseException] = []
+
+        def finish(consume: bool, rid: str) -> None:
+            try:
+                if consume:
+                    limiter.consume(rid)
+                    statuses.append("consumed")
+                else:
+                    limiter.rollback(rid)
+                    statuses.append("rolled")
+            except LimitNotFound:
+                pass
+            except BaseException as error:  # noqa: BLE001
+                errors.append(error)
+
+        threads = []
+        for index, rid in enumerate(ids):
+            threads.append(threading.Thread(target=finish, args=(True, rid)))
+            threads.append(threading.Thread(target=finish, args=(False, rid)))
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(errors, [])
+        self.assertEqual(statuses, [])                            # everything expired: neither endpoint wins
+        state = limiter.state("hot")
+        self.assertEqual((state["remaining"], state["used"]), (10, 0))  # refunded exactly once, never booked
+
+
 class ReservationHttpTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
@@ -469,6 +649,132 @@ class ReservationHttpTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual((body["reservation_id"], body["rolled_back"], body["remaining"], body["capacity"]),
                          (rid, True, 2, 2))
+
+
+class ConsumeHttpTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        import http.client
+
+        cls.http_client = http.client
+        from quota import serve
+
+        cls.clock = Clock()
+        cls.server = serve(port=0, now=cls.clock)
+        cls.port = cls.server.server_address[1]
+        threading.Thread(target=cls.server.serve_forever, daemon=True).start()
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.server.shutdown()
+
+    def request(self, method: str, path: str, body: dict | None = None) -> tuple[int, dict, dict]:
+        data = None if body is None else json.dumps(body).encode()
+        request = urllib.request.Request(f"http://127.0.0.1:{self.port}{path}", data=data, method=method,
+                                         headers={"Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(request, timeout=5) as response:
+                return response.status, json.loads(response.read() or b"{}"), dict(response.headers)
+        except urllib.error.HTTPError as error:
+            return error.code, json.loads(error.read() or b"{}"), dict(error.headers)
+
+    def raw_request(self, method: str, path: str, payload: bytes | None,
+                    content_length: str | object = "auto") -> tuple[int, dict]:
+        connection = self.http_client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        connection.putrequest(method, path)
+        if content_length != "omit":
+            connection.putheader("Content-Length",
+                                 str(len(payload)) if content_length == "auto" else content_length)
+        connection.endheaders(payload if payload is not None else b"")
+        response = connection.getresponse()
+        body = json.loads(response.read() or b"{}")
+        connection.close()
+        return response.status, body
+
+    def test_consume_lifecycle_is_idempotent_and_blocks_rollback(self) -> None:
+        self.request("PUT", "/v1/limits/c-1", {"capacity": 4, "refill_per_second": 1})
+        _, body, _ = self.request("POST", "/v1/reservations", {"key": "c-1", "cost": 3})
+        rid = body["reservation_id"]
+
+        status, first, _ = self.request("POST", f"/v1/reservations/{rid}/consume", {})
+        self.assertEqual(status, 200)
+        self.assertEqual(first, {"reservation_id": rid, "consumed": True,
+                                 "remaining": 1, "capacity": 4, "used": 3})
+        _, state, _ = self.request("GET", "/v1/limits/c-1")
+        self.assertEqual((state["remaining"], state["used"]), (1, 3))    # same instant, same accounting
+
+        type(self).clock.t += 2
+        status, second, _ = self.request("POST", f"/v1/reservations/{rid}/consume", {})
+        self.assertEqual(status, 200)
+        self.assertEqual(second, first)                                   # identical fields, no double used
+        _, state, _ = self.request("GET", "/v1/limits/c-1")
+        self.assertEqual(state["used"], 3)
+
+        self.assertEqual(self.request("DELETE", f"/v1/reservations/{rid}")[0], 404)
+        type(self).clock.t += 100                                         # past TTL: no late refund
+        _, state, _ = self.request("GET", "/v1/limits/c-1")
+        self.assertLessEqual(state["remaining"], 4)
+        self.assertEqual(state["used"], 3)
+
+    def test_consume_unknown_rolled_back_and_expired_are_404(self) -> None:
+        self.request("PUT", "/v1/limits/c-2", {"capacity": 3, "refill_per_second": 0.0001})
+        self.assertEqual(self.request("POST", "/v1/reservations/nope/consume", {})[0], 404)
+
+        _, body, _ = self.request("POST", "/v1/reservations", {"key": "c-2", "cost": 1})
+        rid = body["reservation_id"]
+        self.assertEqual(self.request("DELETE", f"/v1/reservations/{rid}")[0], 200)
+        status, body, _ = self.request("POST", f"/v1/reservations/{rid}/consume", {})
+        self.assertEqual((status, body["error"]["code"]), (404, "not_found"))
+
+        _, body, _ = self.request("POST", "/v1/reservations", {"key": "c-2", "cost": 2, "ttl_seconds": 10})
+        rid = body["reservation_id"]
+        type(self).clock.t += 10                                          # inclusive boundary
+        status, body, _ = self.request("POST", f"/v1/reservations/{rid}/consume", {})
+        self.assertEqual((status, body["error"]["code"]), (404, "not_found"))
+        _, state, _ = self.request("GET", "/v1/limits/c-2")
+        self.assertEqual((state["remaining"], state["used"]), (3, 0))     # refunded, never booked
+
+    def test_consume_validation_errors_are_400_and_change_nothing(self) -> None:
+        self.request("PUT", "/v1/limits/c-3", {"capacity": 3, "refill_per_second": 1})
+        _, body, _ = self.request("POST", "/v1/reservations", {"key": "c-3", "cost": 2})
+        rid = body["reservation_id"]
+        path = f"/v1/reservations/{rid}/consume"
+        for payload in (b"", b"[]", b"null", b"5", b'"x"', b'{"x": 1}', b'{"consumed": true}'):
+            status, parsed = self.raw_request("POST", path, payload)
+            self.assertEqual((status, parsed["error"]["code"]), (400, "invalid_request"), payload)
+        status, parsed = self.raw_request("POST", path, b'{"a": \xff}')   # invalid UTF-8 JSON
+        self.assertEqual((status, parsed["error"]["code"]), (400, "invalid_request"))
+        status, parsed = self.raw_request("POST", path, b"{}", content_length="omit")  # missing
+        self.assertEqual((status, parsed["error"]["code"]), (400, "invalid_request"))
+        status, parsed = self.raw_request("POST", path, b"{}", content_length="nine")  # not an integer
+        self.assertEqual((status, parsed["error"]["code"]), (400, "invalid_request"))
+
+        _, state, _ = self.request("GET", "/v1/limits/c-3")
+        self.assertEqual((state["remaining"], state["used"]), (1, 0))     # nothing was booked
+        self.assertEqual(self.request("DELETE", f"/v1/reservations/{rid}")[0], 200)     # still live
+
+    def test_route_and_method_mismatch_beats_body_validation(self) -> None:
+        # Garbage bodies on non-matching routes still get 404, never 400.
+        status, _ = self.raw_request("POST", "/v1/nope", b'{"x": 1}')
+        self.assertEqual(status, 404)
+        status, _ = self.raw_request("POST", "/v1/reservations/a/b", b'[]')
+        self.assertEqual(status, 404)
+        status, _ = self.raw_request("GET", "/v1/reservations/a/consume", None, content_length="omit")
+        self.assertEqual(status, 404)
+        status, _ = self.raw_request("PUT", "/v1/reservations/a/consume", b'{}')
+        self.assertEqual(status, 404)
+        # The reservation collection still creates reservations: {} there is invalid_request, not consume.
+        self.assertEqual(self.request("POST", "/v1/reservations", {})[0], 400)
+
+    def test_consume_after_reconfigure_books_old_cost_against_new_limit(self) -> None:
+        self.request("PUT", "/v1/limits/c-4", {"capacity": 5, "refill_per_second": 1})
+        _, body, _ = self.request("POST", "/v1/reservations", {"key": "c-4", "cost": 4})
+        rid = body["reservation_id"]
+        self.request("PUT", "/v1/limits/c-4", {"capacity": 10, "refill_per_second": 2})
+        type(self).clock.t += 1.0                                          # 2 tokens at the new rate
+        status, body, _ = self.request("POST", f"/v1/reservations/{rid}/consume", {})
+        self.assertEqual(status, 200)
+        self.assertEqual((body["remaining"], body["capacity"], body["used"]), (3, 10, 4))
 
 
 if __name__ == "__main__":
