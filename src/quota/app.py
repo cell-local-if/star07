@@ -11,6 +11,7 @@ import uuid
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable
+from urllib.parse import parse_qsl, urlsplit
 
 
 class QuotaError(Exception):
@@ -77,6 +78,26 @@ def validate_cost(cost: Any) -> int:
 
 DEFAULT_TTL_SECONDS = 60
 
+# Ledger pagination: a single GET never returns more events than this.
+LEDGER_PAGE_SIZE = 100
+# `after` is a 32-bit signed cursor: strictly decimal, no sign, no fraction, no exponent.
+MAX_AFTER = 2_147_483_647
+
+
+def validate_after(raw: Any) -> int:
+    """Validate the ledger `after` cursor: a non-negative ASCII decimal integer, at most 2**31 - 1.
+
+    Signs, decimal points, exponents, blanks and non-ASCII digits are all rejected; int() alone
+    would silently accept several of those (and unicode digits), so the character set is checked
+    explicitly before converting.
+    """
+    if not isinstance(raw, str) or not raw or any(char not in "0123456789" for char in raw):
+        raise InvalidRequest("after must be a non-negative decimal integer")
+    after = int(raw)
+    if after > MAX_AFTER:
+        raise InvalidRequest(f"after must be at most {MAX_AFTER}")
+    return after
+
 
 def validate_ttl(ttl: Any) -> int:
     if not isinstance(ttl, int) or isinstance(ttl, bool) or ttl < 1 or ttl > 86_400:
@@ -110,6 +131,11 @@ class Limiter:
         # Confirmed holds leave the active registry for good; the value is the exact first consume
         # response, replayed verbatim for idempotent retries (used is never booked a second time).
         self._consumed: dict[str, dict[str, Any]] = {}
+        # Per-key billing ledger: one immutable event per accepted usage (successful check or first
+        # consume of a reservation), in occurrence order, sequenced from 1 with no gaps. Rejected
+        # checks, bare holds, refunds, rollbacks and replayed consumes never append. Reconfiguring
+        # the key keeps the ledger and its sequence running; a process restart starts it empty.
+        self._ledgers: dict[str, list[dict[str, Any]]] = {}
 
     def configure(self, key: Any, payload: Any) -> Limit:
         key = validate_key(key)
@@ -160,6 +186,15 @@ class Limiter:
         bucket.tokens = min(float(self._limits[key].capacity), bucket.tokens + returned)
         return returned
 
+    def _record_event(self, key: str, source: str, cost: int, bucket: Bucket) -> None:
+        """Append one ledger event for a usage that has just been booked. Caller holds the lock and
+        has already pushed `cost` onto the bucket's cost history, so used_after reads off the same
+        accounting the state endpoint reports. The stored event is never mutated afterwards."""
+        events = self._ledgers.setdefault(key, [])
+        events.append({"sequence": len(events) + 1, "source": source, "cost": cost,
+                       "used_after": sum(bucket.cost_history), "event_id": uuid.uuid4().hex,
+                       "occurred_at": self._now()})
+
     def check(self, key: Any, cost: Any) -> dict[str, Any]:
         cost = validate_cost(cost)
         with self._lock:
@@ -169,6 +204,7 @@ class Limiter:
             if bucket.tokens >= cost:
                 bucket.tokens -= cost
                 bucket.cost_history.append(cost)
+                self._record_event(key, "check", cost, bucket)
                 return {"allowed": True, "remaining": int(bucket.tokens), "capacity": limit.capacity}
             deficit = cost - bucket.tokens
             retry_after = deficit / limit.refill_per_second
@@ -243,6 +279,7 @@ class Limiter:
             limit = self._limits[key]
             bucket = self._refill(key)
             bucket.cost_history.append(reservation.cost)
+            self._record_event(key, "reservation_consume", reservation.cost, bucket)
             snapshot = {"reservation_id": reservation_id, "consumed": True,
                         "remaining": int(bucket.tokens), "capacity": limit.capacity,
                         "used": sum(bucket.cost_history)}
@@ -255,6 +292,24 @@ class Limiter:
             self._expire_due(key)
             bucket = self._refill(key)
             return {"limit": limit.as_json(), "remaining": int(bucket.tokens), "used": sum(bucket.cost_history)}
+
+    def ledger(self, key: Any, after: int = 0) -> dict[str, Any]:
+        """Read-only page of the key's billing ledger: events with sequence strictly above `after`.
+
+        The read settles due reservations of the key first, exactly like the state endpoint — the
+        refunds themselves are not usage and never appear as events. At most LEDGER_PAGE_SIZE events
+        are returned, oldest first; next_after is the last returned sequence (the cursor for the
+        next page), or the caller's `after` unchanged when the page is empty. Returned events are
+        copies: the stored ledger entries stay frozen once appended.
+        """
+        key = validate_key(key)
+        with self._lock:
+            self.limit(key)
+            self._expire_due(key)
+            events = self._ledgers.get(key, [])
+            page = [dict(event) for event in events if event["sequence"] > after][:LEDGER_PAGE_SIZE]
+            return {"key": key, "events": page,
+                    "next_after": page[-1]["sequence"] if page else after}
 
 
 def make_handler(limiter: Limiter) -> type[BaseHTTPRequestHandler]:
@@ -295,6 +350,23 @@ def make_handler(limiter: Limiter) -> type[BaseHTTPRequestHandler]:
         def _keys(self) -> list[str]:
             return [p for p in self.path.split("?")[0].split("/") if p]
 
+        def _ledger_after(self) -> int:
+            """Parse the ledger query string: `after` is the only accepted parameter.
+
+            Anything else — an unknown name, a repeated cursor, a sign, a fraction, an exponent,
+            a blank or a non-ASCII digit — is invalid_request and changes no state. Evaluated before
+            the limiter call, so a malformed query answers 400 even when the key itself is unknown.
+            """
+            pairs = parse_qsl(urlsplit(self.path).query, keep_blank_values=True)
+            after: int | None = None
+            for name, value in pairs:
+                if name != "after":
+                    raise InvalidRequest(f"unknown query parameter: {name!r}")
+                if after is not None:
+                    raise InvalidRequest("after must appear at most once")
+                after = validate_after(value)
+            return 0 if after is None else after
+
         def do_GET(self) -> None:  # noqa: N802
             try:
                 parts = self._keys()
@@ -302,6 +374,8 @@ def make_handler(limiter: Limiter) -> type[BaseHTTPRequestHandler]:
                     return self._send(200, {"status": "ok"})
                 if len(parts) == 3 and parts[:2] == ["v1", "limits"]:
                     return self._send(200, limiter.state(parts[2]))
+                if len(parts) == 4 and parts[:2] == ["v1", "limits"] and parts[3] == "ledger":
+                    return self._send(200, limiter.ledger(parts[2], self._ledger_after()))
                 return self._send(404, {"error": {"code": "not_found"}})
             except QuotaError as error:
                 return self._send(error.status, {"error": {"code": error.code, "message": str(error)}})

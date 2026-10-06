@@ -777,5 +777,226 @@ class ConsumeHttpTests(unittest.TestCase):
         self.assertEqual((body["remaining"], body["capacity"], body["used"]), (3, 10, 4))
 
 
+class LedgerUnitTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.clock = Clock()
+        self.limiter = Limiter(self.clock)
+        self.limiter.configure("tenant-a", {"capacity": 5, "refill_per_second": 1.0})
+
+    def test_check_and_consume_record_events_in_order(self) -> None:
+        self.assertTrue(self.limiter.check("tenant-a", 2)["allowed"])       # used 2
+        rid = self.limiter.reserve("tenant-a", 1)["reservation_id"]
+        self.limiter.consume(rid)                                           # used 3
+        self.clock.t += 1.0
+        self.assertTrue(self.limiter.check("tenant-a", 1)["allowed"])       # used 4
+        events = self.limiter.ledger("tenant-a")["events"]
+        self.assertEqual([event["sequence"] for event in events], [1, 2, 3])
+        self.assertEqual([event["source"] for event in events],
+                         ["check", "reservation_consume", "check"])
+        self.assertEqual([event["cost"] for event in events], [2, 1, 1])
+        self.assertEqual([event["used_after"] for event in events], [2, 3, 4])
+        self.assertEqual(events[0]["occurred_at"], 1000.0)
+        self.assertEqual(events[2]["occurred_at"], 1001.0)
+        ids = [event["event_id"] for event in events]
+        self.assertEqual(len(set(ids)), 3)
+        self.assertTrue(all(isinstance(event_id, str) and event_id for event_id in ids))
+
+    def test_concurrent_checks_book_gapless_sequences(self) -> None:
+        limiter = Limiter(self.clock)
+        limiter.configure("hot", {"capacity": 100, "refill_per_second": 0.0001})
+        errors: list[BaseException] = []
+
+        def spend() -> None:
+            try:
+                limiter.check("hot", 1)
+            except OverQuota:
+                pass
+            except BaseException as error:  # noqa: BLE001
+                errors.append(error)
+
+        threads = [threading.Thread(target=spend) for _ in range(300)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(errors, [])
+        events = limiter.ledger("hot")["events"]
+        self.assertEqual(len(events), 100)                                  # no oversell, no lost event
+        self.assertEqual([event["sequence"] for event in events], list(range(1, 101)))
+        self.assertEqual([event["used_after"] for event in events], list(range(1, 101)))
+        self.assertEqual(len({event["event_id"] for event in events}), 100)
+
+    def test_rejected_check_records_no_event(self) -> None:
+        self.limiter.check("tenant-a", 5)                                   # one event, empty bucket
+        with self.assertRaises(OverQuota):
+            self.limiter.check("tenant-a", 1)                               # rejected check
+        with self.assertRaises(OverQuota):
+            self.limiter.reserve("tenant-a", 1)                             # rejected hold
+        events = self.limiter.ledger("tenant-a")["events"]
+        self.assertEqual(len(events), 1)
+        self.assertEqual((events[0]["source"], events[0]["cost"], events[0]["used_after"]),
+                         ("check", 5, 5))
+
+    def test_holds_refunds_rollbacks_and_replays_record_nothing(self) -> None:
+        limiter = Limiter(self.clock)
+        limiter.configure("frozen", {"capacity": 5, "refill_per_second": 0.0001})
+        expiring = limiter.reserve("frozen", 2, ttl_seconds=5)              # hold: no event
+        rolled = limiter.reserve("frozen", 1, ttl_seconds=60)
+        limiter.rollback(rolled["reservation_id"])                          # rollback: no event
+        target = limiter.reserve("frozen", 1, ttl_seconds=60)
+        self.clock.t += 5                                                   # expiring is now due
+        limiter.consume(target["reservation_id"])                           # settles the refund first
+        limiter.consume(target["reservation_id"])                           # replay: no second event
+        events = limiter.ledger("frozen")["events"]
+        self.assertEqual(len(events), 1)
+        self.assertEqual((events[0]["source"], events[0]["cost"], events[0]["used_after"]),
+                         ("reservation_consume", 1, 1))
+        self.assertEqual(limiter.state("frozen")["used"], 1)
+
+    def test_after_filters_strictly_and_next_after_tracks_the_page(self) -> None:
+        for _ in range(3):
+            self.limiter.check("tenant-a", 1)
+        page = self.limiter.ledger("tenant-a", after=1)
+        self.assertEqual([event["sequence"] for event in page["events"]], [2, 3])
+        self.assertEqual(page["next_after"], 3)
+        empty = self.limiter.ledger("tenant-a", after=3)
+        self.assertEqual((empty["events"], empty["next_after"]), ([], 3))
+        fresh = self.limiter.ledger("tenant-a")
+        self.assertEqual(fresh["next_after"], 3)
+        self.assertEqual(self.limiter.ledger("tenant-a", after=0)["next_after"], 3)
+
+    def test_page_is_capped_at_one_hundred_events(self) -> None:
+        self.limiter.configure("bulk", {"capacity": 1_000_000, "refill_per_second": 1.0})
+        for _ in range(150):
+            self.limiter.check("bulk", 1)
+        first = self.limiter.ledger("bulk")
+        self.assertEqual(len(first["events"]), 100)
+        self.assertEqual(first["next_after"], 100)
+        rest = self.limiter.ledger("bulk", after=first["next_after"])
+        self.assertEqual([event["sequence"] for event in rest["events"]], list(range(101, 151)))
+        self.assertEqual(rest["next_after"], 150)
+
+    def test_reconfigure_keeps_ledger_and_sequence_running(self) -> None:
+        self.limiter.check("tenant-a", 2)
+        before = self.limiter.ledger("tenant-a")["events"]
+        self.limiter.configure("tenant-a", {"capacity": 10, "refill_per_second": 2.0})
+        self.clock.t += 1.0
+        self.limiter.check("tenant-a", 1)
+        after = self.limiter.ledger("tenant-a")["events"]
+        self.assertEqual(after[:1], before)                                 # old events frozen
+        self.assertEqual(after[1]["sequence"], 2)
+        self.assertEqual(after[1]["used_after"], 3)                         # used keeps accumulating
+
+    def test_returned_events_are_copies(self) -> None:
+        self.limiter.check("tenant-a", 1)
+        self.limiter.ledger("tenant-a")["events"][0]["cost"] = 999
+        self.assertEqual(self.limiter.ledger("tenant-a")["events"][0]["cost"], 1)
+
+    def test_unknown_key_is_not_found_and_invalid_after_is_rejected(self) -> None:
+        with self.assertRaises(LimitNotFound):
+            self.limiter.ledger("absent")
+        from quota import validate_after
+        for bad in ["", "-1", "+1", "1.0", "1e3", " 1", "1 ", "x", "٢", "2147483648"]:
+            with self.assertRaises(InvalidRequest, msg=bad):
+                validate_after(bad)
+        self.assertEqual(validate_after("0"), 0)
+        self.assertEqual(validate_after("2147483647"), 2147483647)
+        self.assertEqual(validate_after("007"), 7)
+
+
+class LedgerHttpTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        from quota import serve
+
+        cls.clock = Clock()
+        cls.server = serve(port=0, now=cls.clock)
+        cls.port = cls.server.server_address[1]
+        threading.Thread(target=cls.server.serve_forever, daemon=True).start()
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.server.shutdown()
+
+    def request(self, method: str, path: str, body: dict | None = None) -> tuple[int, dict, dict]:
+        data = None if body is None else json.dumps(body).encode()
+        request = urllib.request.Request(f"http://127.0.0.1:{self.port}{path}", data=data, method=method,
+                                         headers={"Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(request, timeout=5) as response:
+                return response.status, json.loads(response.read() or b"{}"), dict(response.headers)
+        except urllib.error.HTTPError as error:
+            return error.code, json.loads(error.read() or b"{}"), dict(error.headers)
+
+    def test_ledger_lifecycle_over_http(self) -> None:
+        self.request("PUT", "/v1/limits/l-1", {"capacity": 4, "refill_per_second": 1})
+        self.request("POST", "/v1/check", {"key": "l-1", "cost": 2})
+        _, body, _ = self.request("POST", "/v1/reservations", {"key": "l-1", "cost": 1})
+        self.request("POST", f"/v1/reservations/{body['reservation_id']}/consume", {})
+
+        status, page, _ = self.request("GET", "/v1/limits/l-1/ledger")
+        self.assertEqual(status, 200)
+        self.assertEqual(page["key"], "l-1")
+        self.assertEqual([event["sequence"] for event in page["events"]], [1, 2])
+        self.assertEqual([event["source"] for event in page["events"]], ["check", "reservation_consume"])
+        self.assertEqual([event["used_after"] for event in page["events"]], [2, 3])
+        self.assertEqual(page["next_after"], 2)
+
+        status, page, _ = self.request("GET", "/v1/limits/l-1/ledger?after=1")
+        self.assertEqual(status, 200)
+        self.assertEqual([event["sequence"] for event in page["events"]], [2])
+        status, page, _ = self.request("GET", "/v1/limits/l-1/ledger?after=2")
+        self.assertEqual((status, page["events"], page["next_after"]), (200, [], 2))
+
+    def test_ledger_read_settles_expiry_without_recording_it(self) -> None:
+        self.request("PUT", "/v1/limits/l-2", {"capacity": 3, "refill_per_second": 0.0001})
+        _, body, _ = self.request("POST", "/v1/reservations", {"key": "l-2", "cost": 2, "ttl_seconds": 5})
+        type(self).clock.t += 5
+        status, page, _ = self.request("GET", "/v1/limits/l-2/ledger")
+        self.assertEqual((status, page["events"], page["next_after"]), (200, [], 0))
+        _, state, _ = self.request("GET", "/v1/limits/l-2")
+        self.assertEqual((state["remaining"], state["used"]), (3, 0))       # refund settled, not booked
+
+    def test_unknown_key_and_bad_routes_are_404(self) -> None:
+        self.assertEqual(self.request("GET", "/v1/limits/absent/ledger")[0], 404)
+        self.assertEqual(self.request("GET", "/v1/limits/a/b/ledger")[0], 404)
+        self.assertEqual(self.request("GET", "/v1/ledger")[0], 404)
+        self.assertEqual(self.request("POST", "/v1/limits/l-1/ledger", {})[0], 404)
+        self.assertEqual(self.request("DELETE", "/v1/limits/l-1/ledger")[0], 404)
+        self.assertEqual(self.request("PUT", "/v1/limits/l-1/ledger", {})[0], 404)
+
+    def test_bad_query_params_are_400_and_change_nothing(self) -> None:
+        self.request("PUT", "/v1/limits/l-3", {"capacity": 2, "refill_per_second": 1})
+        self.request("POST", "/v1/check", {"key": "l-3"})
+        for query in ["after=", "after=-1", "after=+1", "after=1.0", "after=1e2", "after=abc",
+                      "after=2147483648", "after=%E2%82%AC", "foo=1", "after=1&after=2", "after"]:
+            status, body, _ = self.request("GET", f"/v1/limits/l-3/ledger?{query}")
+            self.assertEqual((status, body["error"]["code"]), (400, "invalid_request"), query)
+        # A malformed query answers 400 even for a key that does not exist.
+        self.assertEqual(self.request("GET", "/v1/limits/absent/ledger?after=x")[0], 400)
+        status, page, _ = self.request("GET", "/v1/limits/l-3/ledger?after=0")
+        self.assertEqual(status, 200)
+        self.assertEqual(len(page["events"]), 1)                            # nothing was lost or added
+        _, state, _ = self.request("GET", "/v1/limits/l-3")
+        self.assertEqual((state["remaining"], state["used"]), (1, 1))
+
+    def test_pagination_walks_the_whole_ledger(self) -> None:
+        self.request("PUT", "/v1/limits/l-4", {"capacity": 1_000_000, "refill_per_second": 1})
+        for _ in range(105):
+            self.request("POST", "/v1/check", {"key": "l-4"})
+        seen: list[int] = []
+        after = 0
+        while True:
+            status, page, _ = self.request("GET", f"/v1/limits/l-4/ledger?after={after}")
+            self.assertEqual(status, 200)
+            self.assertLessEqual(len(page["events"]), 100)
+            seen.extend(event["sequence"] for event in page["events"])
+            if not page["events"]:
+                break
+            after = page["next_after"]
+        self.assertEqual(seen, list(range(1, 106)))
+        self.assertEqual(after, 105)
+
+
 if __name__ == "__main__":
     unittest.main()

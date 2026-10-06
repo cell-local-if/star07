@@ -68,6 +68,22 @@ PYTHONPATH=src python3 -m unittest discover -s tests -v
 ### `GET /v1/limits/{key}`
 `200 {"limit": {...}, "remaining": <int>, "used": <int>}`（读取也会先按时间补充，体现当前余量；未确认的预留不计入 `used`）。
 
+### `GET /v1/limits/{key}/ledger`
+只读计费对账账本：按发生顺序列出该 key 已接受的使用，调用方无需从当前令牌状态反推历史。
+- 成功的 `POST /v1/check` 落一条 `source: "check"` 事件；预留**首次**通过 consume 确认时落一条
+  `source: "reservation_consume"` 事件。被拒绝的检查、未确认的预留、到期返还、撤销与重复 consume 均不落账。
+- 每个事件：`{"sequence": <int 从 1 连续递增>, "source": ..., "cost": <本次落账值>,
+  "used_after": <落账后该 key 的 used>, "event_id": <永久唯一的不透明字符串>, "occurred_at": <单调时间源浮点秒>}`。
+  事件一旦落账即冻结，不随新事件或时间推进变化。
+- 查询参数仅接受可选 `after`：只返回 `sequence` 严格大于它的事件（缺省等同 `after=0`）。
+  响应 `200 {"key": ..., "events": [...], "next_after": <int>}`：`events` 按 `sequence` 升序、最多 100 条；
+  有结果时 `next_after` 为最后一条的 `sequence`（即下一页的游标），无结果时等于传入的 `after`。
+- 读取同样先按既有规则结算该 key 已到期的预留（返还不落账）；重配 key 后账本与序号连续保留；
+  运行期内分页结果稳定，进程重启允许从空账本开始。
+- key 未配置 ⇒ `404 not_found`；路径或方法不匹配 ⇒ 先 `404 not_found`；未知查询参数，或 `after`
+  不是非负 ASCII 十进制整数（含正负号、小数点、指数、空白或非 ASCII 数字）或超过 `2147483647`
+  ⇒ `400 invalid_request`，且不改变任何状态。
+
 ## 错误语义
 
 ```json
@@ -78,5 +94,5 @@ PYTHONPATH=src python3 -m unittest discover -s tests -v
 
 ## 未实现（后续任务候选，非固定题单）
 
-滑动窗口/漏桶、分层配额、跨实例一致、热点键、降级与熔断、配额账本与计费对账、配置热更新的原子切换、
+滑动窗口/漏桶、分层配额、跨实例一致、热点键、降级与熔断、配置热更新的原子切换、
 时钟偏斜处理、可观测性与压测基线。
