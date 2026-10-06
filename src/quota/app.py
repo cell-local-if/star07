@@ -11,6 +11,7 @@ import uuid
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable
+from urllib.parse import parse_qs, urlsplit
 
 
 class QuotaError(Exception):
@@ -77,6 +78,9 @@ def validate_cost(cost: Any) -> int:
 
 DEFAULT_TTL_SECONDS = 60
 
+DEFAULT_LEDGER_EVENTS = 100
+MAX_LEDGER_EVENTS = 1000
+
 
 def validate_ttl(ttl: Any) -> int:
     if not isinstance(ttl, int) or isinstance(ttl, bool) or ttl < 1 or ttl > 86_400:
@@ -119,6 +123,10 @@ class Limiter:
         # Confirmed holds leave the active registry for good; the value is the exact first consume
         # response, replayed verbatim for idempotent retries (used is never booked a second time).
         self._consumed: dict[str, dict[str, Any]] = {}
+        # Per-key append-only ledger of actual consumption (successful checks and first consumes).
+        # Events are appended under the lock exactly where cost_history is booked, so per-key seq
+        # values are gapless and the totals always agree with `used`. In-memory only, like the rest.
+        self._ledgers: dict[str, list[dict[str, Any]]] = {}
         # Highest clock reading ever observed; the effective moment never moves below it.
         self._watermark = float("-inf")
 
@@ -179,6 +187,16 @@ class Limiter:
         bucket.tokens = min(float(self._limits[key].capacity), bucket.tokens + returned)
         return returned
 
+    def _record_event(self, key: str, source: str, reservation_id: str | None, cost: int,
+                      bucket: Bucket, limit: Limit, now: float) -> None:
+        """Append exactly one ledger event for a booking that just happened. Caller holds the lock;
+        `now` is the producing operation's single effective moment and the bucket is already booked.
+        """
+        events = self._ledgers.setdefault(key, [])
+        events.append({"seq": len(events) + 1, "source": source, "reservation_id": reservation_id,
+                       "cost": cost, "remaining": int(bucket.tokens), "capacity": limit.capacity,
+                       "effective_at": now})
+
     def check(self, key: Any, cost: Any) -> dict[str, Any]:
         cost = validate_cost(cost)
         with self._lock:
@@ -189,6 +207,7 @@ class Limiter:
             if bucket.tokens >= cost:
                 bucket.tokens -= cost
                 bucket.cost_history.append(cost)
+                self._record_event(key, "check", None, cost, bucket, limit, now)
                 return {"allowed": True, "remaining": int(bucket.tokens), "capacity": limit.capacity}
             deficit = cost - bucket.tokens
             retry_after = deficit / limit.refill_per_second
@@ -266,6 +285,8 @@ class Limiter:
             limit = self._limits[key]
             bucket = self._refill(key, now)
             bucket.cost_history.append(reservation.cost)
+            self._record_event(key, "reservation_consume", reservation_id, reservation.cost,
+                               bucket, limit, now)
             snapshot = {"reservation_id": reservation_id, "consumed": True,
                         "remaining": int(bucket.tokens), "capacity": limit.capacity,
                         "used": sum(bucket.cost_history)}
@@ -279,6 +300,26 @@ class Limiter:
             self._expire_due(key, now)
             bucket = self._refill(key, now)
             return {"limit": limit.as_json(), "remaining": int(bucket.tokens), "used": sum(bucket.cost_history)}
+
+    def ledger(self, key: str, events_limit: int = DEFAULT_LEDGER_EVENTS) -> dict[str, Any]:
+        """Read-only quota ledger for one key: totals plus the most recent consumption events.
+
+        Shares the lock and the single-effective-moment semantics of every other public operation
+        (a stalled or regressed clock neither refunds, refills nor books here). The totals cover
+        every event ever booked for the key, so accepted_cost always equals the `used` reported by
+        state(); `events` returns at most `events_limit` entries, the most recent ones, in
+        ascending seq order.
+        """
+        with self._lock:
+            now = self._tick()
+            self.limit(key)
+            self._expire_due(key, now)
+            self._refill(key, now)
+            events = self._ledgers.get(key, [])
+            return {"key": key,
+                    "totals": {"accepted_count": len(events),
+                               "accepted_cost": sum(event["cost"] for event in events)},
+                    "events": [dict(event) for event in events[-events_limit:]]}
 
 
 def make_handler(limiter: Limiter) -> type[BaseHTTPRequestHandler]:
@@ -319,6 +360,22 @@ def make_handler(limiter: Limiter) -> type[BaseHTTPRequestHandler]:
         def _keys(self) -> list[str]:
             return [p for p in self.path.split("?")[0].split("/") if p]
 
+        def _ledger_events_limit(self) -> int:
+            """Validate the ledger query string: only `events` is allowed, an integer in 1..1000."""
+            query = parse_qs(urlsplit(self.path).query, keep_blank_values=True)
+            unknown = set(query) - {"events"}
+            if unknown:
+                raise InvalidRequest(f"unknown query parameters: {sorted(unknown)}")
+            values = query.get("events")
+            if values is None:
+                return DEFAULT_LEDGER_EVENTS
+            if len(values) != 1 or not values[0].isascii() or not values[0].isdigit():
+                raise InvalidRequest(f"events must be an integer between 1 and {MAX_LEDGER_EVENTS}")
+            limit = int(values[0])
+            if limit < 1 or limit > MAX_LEDGER_EVENTS:
+                raise InvalidRequest(f"events must be an integer between 1 and {MAX_LEDGER_EVENTS}")
+            return limit
+
         def do_GET(self) -> None:  # noqa: N802
             try:
                 parts = self._keys()
@@ -326,6 +383,8 @@ def make_handler(limiter: Limiter) -> type[BaseHTTPRequestHandler]:
                     return self._send(200, {"status": "ok"})
                 if len(parts) == 3 and parts[:2] == ["v1", "limits"]:
                     return self._send(200, limiter.state(parts[2]))
+                if len(parts) == 3 and parts[:2] == ["v1", "ledgers"]:
+                    return self._send(200, limiter.ledger(parts[2], self._ledger_events_limit()))
                 return self._send(404, {"error": {"code": "not_found"}})
             except QuotaError as error:
                 return self._send(error.status, {"error": {"code": error.code, "message": str(error)}})

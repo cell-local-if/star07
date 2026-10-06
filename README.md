@@ -77,6 +77,21 @@ PYTHONPATH=src python3 -m unittest discover -s tests -v
 ### `GET /v1/limits/{key}`
 `200 {"limit": {...}, "remaining": <int>, "used": <int>}`（读取也会先按时间补充，体现当前余量；未确认的预留不计入 `used`）。
 
+### `GET /v1/ledgers/{key}`
+只读配额账本：核对一笔额度来自即时 `check` 还是预留 `consume`。
+- 成功：`200 {"key": ..., "totals": {"accepted_count": <int>, "accepted_cost": <int>}, "events": [...]}`；
+  `accepted_cost` 与 `GET /v1/limits/{key}` 的 `used` 恒等，`accepted_count` 为该 key 累计落账笔数。
+- `events` 按 `seq` 升序给出**最近**若干条事件；查询参数 `events` 只接受 `1..1000` 的整数，缺省 `100`。
+  每条事件：`{"seq": <int 从 1 连续递增>, "source": "check"|"reservation_consume", "reservation_id": <string|null>,
+  "cost": <int 实际记账数>, "remaining": <int>, "capacity": <int>, "effective_at": <number>}`；
+  `check` 事件的 `reservation_id` 为 `null`，consume 事件使用原预留标识；`remaining`/`capacity` 取记账完成时的数值，
+  `effective_at` 为产生事件的操作在同一临界区内采样的有效时刻。
+- 只有成功的 `check` 与首次成功的 `consume` 各生成一条事件；重复 consume、令牌不足、回滚、到期返还与校验失败均不落账。
+- 与其他公开操作共用同一把锁与有效时刻/高水位线语义：并发下 `seq` 不缺号不重复，totals 与 `used` 一致；
+  时钟停住或回拨时读取不提前退款、不补充、不落账。状态仍在进程内存中，无持久化或跨进程承诺。
+- 未配置的 key ⇒ `404 not_found`；`events` 非法或含未知查询参数 ⇒ `400 invalid_request`（先于 `not_found`）；
+  路径或方法不匹配 ⇒ `404 not_found`。
+
 ## 错误语义
 
 ```json
@@ -87,5 +102,5 @@ PYTHONPATH=src python3 -m unittest discover -s tests -v
 
 ## 未实现（后续任务候选，非固定题单）
 
-滑动窗口/漏桶、分层配额、跨实例一致、热点键、降级与熔断、配额账本与计费对账、配置热更新的原子切换、
+滑动窗口/漏桶、分层配额、跨实例一致、热点键、降级与熔断、配置热更新的原子切换、
 可观测性与压测基线。
