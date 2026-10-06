@@ -81,6 +81,25 @@ class Reservation:
         return self.created_at + self.ttl_seconds
 
 
+@dataclass(frozen=True)
+class WindowConfig:
+    """One sliding-window limit: at most max_events successful admissions per window_seconds."""
+
+    window_seconds: int
+    max_events: int
+
+    def as_json(self) -> dict[str, Any]:
+        return {"window_seconds": self.window_seconds, "max_events": self.max_events}
+
+
+@dataclass
+class SlidingWindow:
+    """Accepted-admission timestamps for one window key, oldest first; nothing else ever lands here."""
+
+    config: WindowConfig
+    events: list[float] = field(default_factory=list)
+
+
 def validate_key(key: Any) -> str:
     if not isinstance(key, str) or not key or len(key) > 200:
         raise InvalidRequest("key must be a non-empty string of at most 200 characters")
@@ -127,6 +146,22 @@ def validate_limit(payload: Any) -> Limit:
     return Limit(int(capacity), float(rate))
 
 
+def validate_window(payload: Any) -> WindowConfig:
+    if not isinstance(payload, dict):
+        raise InvalidRequest("body must be a JSON object")
+    extra = set(payload) - {"window_seconds", "max_events"}
+    if extra:
+        raise InvalidRequest(f"unknown fields: {sorted(extra)}")
+    window_seconds, max_events = payload.get("window_seconds"), payload.get("max_events")
+    if (not isinstance(window_seconds, int) or isinstance(window_seconds, bool)
+            or window_seconds < 1 or window_seconds > 3_600):
+        raise InvalidRequest("window_seconds must be an integer between 1 and 3600")
+    if (not isinstance(max_events, int) or isinstance(max_events, bool)
+            or max_events < 1 or max_events > 1_000_000):
+        raise InvalidRequest("max_events must be an integer between 1 and 1000000")
+    return WindowConfig(window_seconds, max_events)
+
+
 class Limiter:
     """One token bucket per tenant key. `now` is a seconds callable, injected for tests.
 
@@ -152,6 +187,9 @@ class Limiter:
         # Entries are appended inside the lock at booking time, so seq is dense and gap-free even
         # under concurrent settling; the list is never trimmed (read-only views take a tail slice).
         self._ledgers: dict[str, list[LedgerEvent]] = {}
+        # Independent sliding windows, keyed in their own namespace: a window named like a bucket
+        # shares neither history nor accounting with it, and window admissions never touch a ledger.
+        self._windows: dict[str, SlidingWindow] = {}
         # Highest clock reading ever observed; the effective moment never moves below it.
         self._watermark = float("-inf")
 
@@ -352,6 +390,84 @@ class Limiter:
                 "events": [event.as_json() for event in events[-event_limit:]],
             }
 
+    def _expire_window(self, window: SlidingWindow, now: float) -> None:
+        """Drop every window event whose age has reached window_seconds at this effective moment.
+
+        An event admitted at effective_at leaves the window at effective_at + window_seconds, i.e.
+        it is stale once effective_at <= now - window_seconds: the boundary is inclusive, so an old
+        event stamped exactly on the edge is settled before admission is judged. Admissions are
+        stamped with the non-decreasing watermark, so the surviving timestamps are an ordered tail
+        and one prefix drop settles them all. A stalled clock produces an identical cutoff and drops
+        nothing; a regressed reading is clamped to the watermark before the cutoff is ever computed.
+        Caller holds the lock and supplies the operation's single effective moment.
+        """
+        cutoff = now - window.config.window_seconds
+        events = window.events
+        index = 0
+        while index < len(events) and events[index] <= cutoff:
+            index += 1
+        if index:
+            del events[:index]
+
+    def configure_window(self, key: Any, payload: Any) -> WindowConfig:
+        """Create or replace a window's configuration while keeping its admitted history.
+
+        The new config governs the response and every later admission. Shortening window_seconds
+        settles the (now out-of-window) prefix immediately at this effective moment; lowering
+        max_events never revokes past admissions — the surviving history stands and only subsequent
+        checks are rejected. Invalid input is rejected before the lock and changes nothing.
+        """
+        key = validate_key(key)
+        config = validate_window(payload)
+        with self._lock:
+            now = self._tick()
+            window = self._windows.get(key)
+            if window is None:
+                self._windows[key] = SlidingWindow(config)
+            else:
+                window.config = config
+                self._expire_window(window, now)
+        return config
+
+    def window_state(self, key: Any) -> dict[str, Any]:
+        """The same {window, used, remaining} snapshot a check at this effective moment would see."""
+        key = validate_key(key)
+        with self._lock:
+            now = self._tick()
+            window = self._windows.get(key)
+            if window is None:
+                raise LimitNotFound(f"no window configured for {key!r}")
+            self._expire_window(window, now)
+            used = len(window.events)
+            return {"window": window.config.as_json(), "used": used,
+                    "remaining": window.config.max_events - used}
+
+    def window_check(self, key: Any) -> dict[str, Any]:
+        """Atomically admit one request into the sliding window, counting successful admissions only.
+
+        Stale events leave first (boundary inclusive). With fewer than max_events live events the
+        request is counted at this single effective moment and the returned used already includes
+        it; a full window rejects without appending, and Retry-After is the exact wait until the
+        earliest live event leaves, which every concurrent reject at this moment computes alike.
+        """
+        key = validate_key(key)
+        with self._lock:
+            now = self._tick()
+            window = self._windows.get(key)
+            if window is None:
+                raise LimitNotFound(f"no window configured for {key!r}")
+            self._expire_window(window, now)
+            config = window.config
+            used = len(window.events)
+            if used >= config.max_events:
+                retry_after = window.events[0] + config.window_seconds - now
+                raise OverQuota(f"window for {key!r} is full: {used}/{config.max_events} events",
+                                retry_after)
+            window.events.append(now)
+            used += 1
+            return {"allowed": True, "used": used, "remaining": config.max_events - used,
+                    "limit": config.max_events, "window_seconds": config.window_seconds}
+
 
 def make_handler(limiter: Limiter) -> type[BaseHTTPRequestHandler]:
     class Handler(BaseHTTPRequestHandler):
@@ -454,6 +570,8 @@ def make_handler(limiter: Limiter) -> type[BaseHTTPRequestHandler]:
                     # validation precedes quota classification everywhere else.
                     event_limit = self._ledger_event_limit()
                     return self._send(200, limiter.ledger(parts[2], event_limit))
+                if len(parts) == 3 and parts[:2] == ["v1", "windows"]:
+                    return self._send(200, limiter.window_state(parts[2]))
                 return self._send(404, {"error": {"code": "not_found"}})
             except QuotaError as error:
                 return self._send(error.status, {"error": {"code": error.code, "message": str(error)}})
@@ -464,6 +582,9 @@ def make_handler(limiter: Limiter) -> type[BaseHTTPRequestHandler]:
             try:
                 parts = self._route_segments()
                 if len(parts) != 3 or parts[:2] != ["v1", "limits"]:
+                    if len(parts) == 3 and parts[:2] == ["v1", "windows"]:
+                        window = limiter.configure_window(parts[2], self._read_json())
+                        return self._send(200, {"key": parts[2], "window": window.as_json()})
                     return self._send(404, {"error": {"code": "not_found"}})
                 limit = limiter.configure(parts[2], self._read_json())
                 return self._send(200, {"key": parts[2], "limit": limit.as_json()})
@@ -494,6 +615,12 @@ def make_handler(limiter: Limiter) -> type[BaseHTTPRequestHandler]:
                     if not isinstance(body, dict) or body:
                         raise InvalidRequest('body must be an empty JSON object {}')
                     result = limiter.consume(parts[2])
+                    return self._send(200, result)
+                if len(parts) == 4 and parts[:2] == ["v1", "windows"] and parts[3] == "check":
+                    body = self._read_json()
+                    if not isinstance(body, dict) or body:
+                        raise InvalidRequest('body must be an empty JSON object {}')
+                    result = limiter.window_check(parts[2])
                     return self._send(200, result)
                 return self._send(404, {"error": {"code": "not_found"}})
             except OverQuota as error:

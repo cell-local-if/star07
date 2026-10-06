@@ -92,6 +92,44 @@ PYTHONPATH=src python3 -m unittest discover -s tests -v
 - 未配置的 key ⇒ `404 not_found`；`events` 不是 1..1000 内的整数字面量、参数重复或出现任何未知查询参数
   ⇒ `400 invalid_request`（查询校验先于 key 的 404）；路径段数不对或方法不匹配 ⇒ `404 not_found`。
 
+### `PUT /v1/windows/{key}`
+与令牌桶**彼此独立**的精确滑动窗口限流：创建或更新窗口。请求体只接受
+`{"window_seconds": <int 1..3600>, "max_events": <int 1..1000000>}`（两者均须为非布尔整数，不允许缺省、
+浮点数或布尔值，不允许未知字段）。
+- 成功：`200 {"key": ..., "window": {"window_seconds": <int>, "max_events": <int>}}`。
+- **热更新保留已准入历史**：新配置在响应时即生效；缩短 `window_seconds` 立即淘汰窗外事件；
+  降低 `max_events` **不追溯撤销**已准入请求，只拒绝后续请求。
+- 无效配置、未知字段、非法 key（与令牌桶同一 key 规则：非空 ≤200 字符的字符串）⇒ `400 invalid_request`，
+  且不改任何状态。
+
+### `POST /v1/windows/{key}/check`
+请求体**必须是空 JSON 对象 `{}`**（非空对象、非对象、畸形 JSON 或缺 `Content-Length` ⇒ `400 invalid_request`）。
+- 只统计窗口内**已成功准入**的请求：未达到 `max_events` 时在同一临界区内原子计入本次，
+  返回 `200 {"allowed": true, "used": <int>, "remaining": <int>, "limit": <int>, "window_seconds": <int>}`；
+  `used` 包含本次，`remaining = max_events - used`，`limit = max_events`。
+- 窗口满：**`429`** `{"error":{"code":"over_quota",...}}` 并带 **`Retry-After`**——最早有效事件离开窗口
+  所需的精确秒数（`最早事件时刻 + window_seconds - 当前有效时刻`），与令牌桶同一口径：按毫秒**向上取整**、
+  保留三位小数（亚毫秒也给 `0.001`，永不为 `0.000`）；被拒请求不计入。
+- 未知窗口 ⇒ `404 not_found`；路径段数不对、末段不是 `check` 或方法不匹配 ⇒ **先**返回 `404 not_found`
+  且不读请求体。
+
+### `GET /v1/windows/{key}`
+返回 check 同一有效时刻下的同一快照：`200 {"window": {...}, "used": <int>, "remaining": <int>}`
+（先淘汰窗外事件再计数；未知窗口 ⇒ `404 not_found`）。
+
+#### 滑动窗口的时间语义（确定性）
+- 有效时刻沿用令牌桶的**单调时钟高水位线**口径，与令牌桶共用同一把锁、同一次 `_tick`：每个公开操作
+  进入锁后只采样一次；时钟停住时淘汰截止线不变、不淘汰事件；读数回拨视为停留在水位线，恢复后
+  回拨区间不会被重复计入（已准入事件不会因此提前或延后离开）。
+- 事件在 `effective_at + window_seconds` 处到期，即 `effective_at <= now - window_seconds` 即为窗外：
+  **边界取大于等于，恰在边界的旧事件先淘汰**，然后才判断本次准入。
+- 并发 check 与 PUT 更新在同一把锁下串行：既不会超过 `max_events`，也不会重复计数或漏计。
+
+#### 与令牌桶的隔离
+- 窗口只存进程内存，与同名令牌桶 key **相互隔离**：`PUT /v1/windows/k` 不创建 `/v1/limits/k`，反之亦然。
+- 窗口准入**不进入** `GET /v1/limits/{key}` 的 `used`，也不写入 `/v1/ledgers/{key}` 账本；令牌桶的
+  check、配置、预留、consume、rollback、状态与账本的公开行为完全不变。
+
 ## 错误语义
 
 ```json
@@ -102,5 +140,5 @@ PYTHONPATH=src python3 -m unittest discover -s tests -v
 
 ## 未实现（后续任务候选，非固定题单）
 
-滑动窗口/漏桶、分层配额、跨实例一致、热点键、降级与熔断、配置热更新的原子切换、
+漏桶、分层配额、跨实例一致、热点键、降级与熔断、配置热更新的原子切换、
 可观测性与压测基线。
