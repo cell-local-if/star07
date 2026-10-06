@@ -954,5 +954,401 @@ class ClockRegressionHttpTests(unittest.TestCase):
         self.assertEqual(state["remaining"], 10)
 
 
+class LedgerUnitTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.clock = Clock()
+        self.limiter = Limiter(self.clock)
+        self.limiter.configure("tenant-a", {"capacity": 5, "refill_per_second": 1.0})
+
+    def test_successful_check_records_one_event_matching_used(self) -> None:
+        start = self.clock.t                                      # effective moment of the calls
+        result = self.limiter.check("tenant-a", 2)
+        ledger = self.limiter.ledger("tenant-a")
+        self.assertEqual(set(ledger), {"key", "totals", "events"})
+        self.assertEqual(ledger["key"], "tenant-a")
+        self.assertEqual(ledger["totals"], {"accepted_count": 1, "accepted_cost": 2})
+        event, = ledger["events"]
+        self.assertEqual(set(event), {"seq", "source", "reservation_id", "cost",
+                                      "remaining", "capacity", "effective_at"})
+        self.assertEqual(event, {"seq": 1, "source": "check", "reservation_id": None, "cost": 2,
+                                 "remaining": 3, "capacity": 5, "effective_at": start})
+        self.assertEqual(event["remaining"], result["remaining"])
+        self.assertEqual(ledger["totals"]["accepted_cost"], self.limiter.state("tenant-a")["used"])
+
+    def test_successful_consume_records_one_event_with_reservation_id(self) -> None:
+        limiter = Limiter(self.clock)
+        limiter.configure("frozen", {"capacity": 5, "refill_per_second": 0.0001})
+        reservation = limiter.reserve("frozen", 3, ttl_seconds=60)  # tokens 2, still no event
+        self.assertEqual(limiter.ledger("frozen")["events"], [])
+        self.clock.t += 5                                            # refill negligible here
+        limiter.consume(reservation["reservation_id"])
+        ledger = limiter.ledger("frozen")
+        self.assertEqual(ledger["totals"], {"accepted_count": 1, "accepted_cost": 3})
+        event, = ledger["events"]
+        self.assertEqual(event["source"], "reservation_consume")
+        self.assertEqual(event["reservation_id"], reservation["reservation_id"])
+        self.assertEqual((event["cost"], event["remaining"], event["capacity"]), (3, 2, 5))
+        self.assertEqual(event["effective_at"], self.clock.t)    # the consume's own effective moment
+
+    def test_duplicate_consume_appends_no_second_event(self) -> None:
+        reservation = self.limiter.reserve("tenant-a", 2)
+        first = self.limiter.consume(reservation["reservation_id"])
+        self.clock.t += 3
+        self.assertTrue(self.limiter.check("tenant-a", 1)["allowed"])
+        second = self.limiter.consume(reservation["reservation_id"])
+        self.assertEqual(second, first)                          # baseline idempotency intact
+        ledger = self.limiter.ledger("tenant-a", 1000)
+        self.assertEqual([event["source"] for event in ledger["events"]],
+                         ["reservation_consume", "check"])
+        self.assertEqual(ledger["totals"], {"accepted_count": 2, "accepted_cost": 3})
+        self.assertEqual(self.limiter.state("tenant-a")["used"], 3)
+
+    def test_failures_rollbacks_and_expiries_generate_no_events(self) -> None:
+        for _ in range(5):
+            self.limiter.check("tenant-a", 1)
+        with self.assertRaises(OverQuota):
+            self.limiter.check("tenant-a", 1)                    # rejected: nothing booked
+        self.clock.t += 5                                        # refill to a full bucket
+        reservation = self.limiter.reserve("tenant-a", 2)        # hold: not booked
+        self.limiter.rollback(reservation["reservation_id"])     # undone: not booked
+        expiring = self.limiter.reserve("tenant-a", 2, ttl_seconds=5)
+        self.clock.t += 5
+        self.limiter.state("tenant-a")                           # settles the due hold
+        with self.assertRaises(LimitNotFound):
+            self.limiter.consume(expiring["reservation_id"])     # expired hold never books
+        ledger = self.limiter.ledger("tenant-a", 1000)
+        self.assertEqual(ledger["totals"], {"accepted_count": 5, "accepted_cost": 5})
+        self.assertTrue(all(event["source"] == "check" for event in ledger["events"]))
+        self.assertEqual(self.limiter.state("tenant-a")["used"], 5)
+
+    def test_seq_is_dense_across_mixed_sources(self) -> None:
+        self.limiter.check("tenant-a", 1)                        # tokens 4
+        reservation = self.limiter.reserve("tenant-a", 2)        # tokens 2
+        self.limiter.consume(reservation["reservation_id"])      # tokens stay 2, used 3
+        self.limiter.check("tenant-a", 1)                        # tokens 1, used 4
+        ledger = self.limiter.ledger("tenant-a", 1000)
+        events = ledger["events"]
+        self.assertEqual([event["seq"] for event in events], [1, 2, 3])
+        self.assertEqual([event["source"] for event in events],
+                         ["check", "reservation_consume", "check"])
+        self.assertEqual([event["cost"] for event in events], [1, 2, 1])
+        self.assertEqual([event["reservation_id"] for event in events],
+                         [None, reservation["reservation_id"], None])
+        self.assertEqual(ledger["totals"], {"accepted_count": 3, "accepted_cost": 4})
+        self.assertEqual(self.limiter.state("tenant-a")["used"], 4)
+
+    def test_tail_defaults_to_100_and_limits_select_the_newest_events(self) -> None:
+        limiter = Limiter(self.clock)
+        limiter.configure("big", {"capacity": 1000, "refill_per_second": 0.0001})
+        for _ in range(150):
+            limiter.check("big", 1)                              # clock frozen: all 150 book
+        default = limiter.ledger("big")
+        self.assertEqual(len(default["events"]), 100)
+        self.assertEqual([event["seq"] for event in default["events"]], list(range(51, 151)))
+        fifty = limiter.ledger("big", 50)
+        self.assertEqual([event["seq"] for event in fifty["events"]], list(range(101, 151)))
+        one = limiter.ledger("big", 1)
+        self.assertEqual([event["seq"] for event in one["events"]], [150])
+        full = limiter.ledger("big", 1000)
+        self.assertEqual([event["seq"] for event in full["events"]], list(range(1, 151)))
+        # Totals always describe the complete history, regardless of the tail window.
+        for view in (default, fifty, one, full):
+            self.assertEqual(view["totals"], {"accepted_count": 150, "accepted_cost": 150})
+
+    def test_unknown_key_ledger_is_not_found(self) -> None:
+        with self.assertRaises(LimitNotFound):
+            self.limiter.ledger("tenant-x")
+
+    def test_ledger_read_samples_no_clock_and_advances_no_watermark(self) -> None:
+        clock = Clock()
+        clock.t = 100.0
+        limiter = Limiter(clock)
+        limiter.configure("k", {"capacity": 10, "refill_per_second": 1.0})
+        limiter.check("k", 10)                                   # empty bucket, watermark 100
+        clock.t = 105.0
+        limiter.ledger("k")                                      # must not sample the clock
+        clock.t = 104.0                                          # below the reading the ledger skipped
+        # state() ticks now: effective = max(104, watermark). A ledger that had ticked would have
+        # pinned the watermark to 105 and this read would show 5 refilled tokens instead of 4.
+        self.assertEqual(limiter.state("k")["remaining"], 4)
+
+    def test_ledger_read_settles_no_due_reservation_and_conjures_no_tokens(self) -> None:
+        limiter = Limiter(self.clock)
+        limiter.configure("frozen", {"capacity": 5, "refill_per_second": 0.0001})
+        reservation = limiter.reserve("frozen", 3, ttl_seconds=10)  # tokens 2
+        self.clock.t += 10                                       # the hold is now due
+        view = limiter.ledger("frozen")
+        self.assertEqual(view["totals"], {"accepted_count": 0, "accepted_cost": 0})
+        self.assertIn(reservation["reservation_id"], limiter._reservations)  # not settled by a read
+        state = limiter.state("frozen")                          # this read performs the one refund
+        self.assertEqual((state["remaining"], state["used"]), (5, 0))
+        self.assertNotIn(reservation["reservation_id"], limiter._reservations)
+        self.assertEqual(limiter.ledger("frozen")["events"], [])
+
+    def test_stalled_or_regressed_clock_returns_identical_ledgers(self) -> None:
+        self.limiter.check("tenant-a", 2)
+        first = self.limiter.ledger("tenant-a", 1000)
+        self.clock.t += 100                                      # a read never samples this...
+        second = self.limiter.ledger("tenant-a", 1000)
+        self.clock.t -= 200                                      # ...nor a regression
+        third = self.limiter.ledger("tenant-a", 1000)
+        self.assertEqual(second, first)
+        self.assertEqual(third, first)
+
+    def test_reconfigure_keeps_history_and_new_events_use_new_capacity(self) -> None:
+        self.limiter.check("tenant-a", 2)                        # tokens 3
+        self.limiter.configure("tenant-a", {"capacity": 10, "refill_per_second": 2.0})
+        self.limiter.check("tenant-a", 1)                        # min(3,10) -> tokens 2
+        ledger = self.limiter.ledger("tenant-a", 1000)
+        self.assertEqual([event["capacity"] for event in ledger["events"]], [5, 10])
+        self.assertEqual([event["remaining"] for event in ledger["events"]], [3, 2])
+        self.assertEqual(ledger["totals"], {"accepted_count": 2, "accepted_cost": 3})
+        self.assertEqual(self.limiter.state("tenant-a")["used"], 3)
+
+    def test_concurrent_mixed_operations_keep_a_dense_consistent_ledger(self) -> None:
+        limiter = Limiter(self.clock)                            # clock frozen for the whole test
+        limiter.configure("hot", {"capacity": 300, "refill_per_second": 0.0001})
+        rids = [limiter.reserve("hot", 1, ttl_seconds=3600)["reservation_id"] for _ in range(100)]
+        consumed: list[str] = []
+        rolled: list[str] = []
+        errors: list[BaseException] = []
+        reader_counts: list[list[int]] = []
+        list_lock = threading.Lock()
+        tail_choices = [1, 2, 7, 100, 999, 1000]
+
+        def spend_check() -> None:
+            try:
+                limiter.check("hot", 1)                          # 200 free tokens: every check wins
+            except BaseException as error:  # noqa: BLE001
+                with list_lock:
+                    errors.append(error)
+
+        def settle(do_consume: bool, rid: str) -> None:
+            try:
+                if do_consume:
+                    limiter.consume(rid)
+                    with list_lock:
+                        consumed.append(rid)
+                else:
+                    limiter.rollback(rid)
+                    with list_lock:
+                        rolled.append(rid)
+            except LimitNotFound:
+                pass
+            except BaseException as error:  # noqa: BLE001
+                with list_lock:
+                    errors.append(error)
+
+        def read_ledger(reader_index: int) -> None:
+            counts: list[int] = []
+            try:
+                for round_index in range(50):
+                    tail = tail_choices[(reader_index + round_index) % len(tail_choices)]
+                    view = limiter.ledger("hot", tail)
+                    events = view["events"]
+                    count = view["totals"]["accepted_count"]
+                    seqs = [event["seq"] for event in events]
+                    if len(events) != min(tail, count) \
+                            or seqs != list(range(count - len(seqs) + 1, count + 1)):
+                        raise AssertionError(f"inconsistent ledger view: {view['totals']}, {seqs}")
+                    if any(event["source"] not in ("check", "reservation_consume") for event in events):
+                        raise AssertionError("unexpected event source")
+                    counts.append(count)
+                if counts != sorted(counts):
+                    raise AssertionError("accepted_count went backwards during reads")
+            except BaseException as error:  # noqa: BLE001
+                with list_lock:
+                    errors.append(error)
+            with list_lock:
+                reader_counts.append(counts)
+
+        threads = [threading.Thread(target=spend_check) for _ in range(100)]
+        for index, rid in enumerate(rids):
+            threads.append(threading.Thread(target=settle, args=(True, rid)))
+            threads.append(threading.Thread(target=settle, args=(False, rid)))
+        threads += [threading.Thread(target=read_ledger, args=(index,)) for index in range(6)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(errors, [])
+
+        ledger = limiter.ledger("hot", 1000)
+        events = ledger["events"]
+        booked = 100 + len(consumed)
+        self.assertEqual([event["seq"] for event in events], list(range(1, booked + 1)))  # no gap/dup
+        self.assertEqual(ledger["totals"], {"accepted_count": booked, "accepted_cost": booked})
+        self.assertEqual(limiter.state("hot")["used"], booked)   # totals never under/over-count
+        self.assertEqual(len(consumed) + len(rolled), 100)
+        self.assertEqual(set(consumed) & set(rolled), set())
+        self.assertEqual([event["source"] for event in events].count("check"), 100)
+        consume_events = [event for event in events if event["source"] == "reservation_consume"]
+        self.assertEqual(len(consume_events), len(consumed))
+        self.assertEqual({event["reservation_id"] for event in consume_events}, set(consumed))
+        self.assertTrue(all(event["reservation_id"] is None
+                            for event in events if event["source"] == "check"))
+        self.assertTrue(all(counts[-1] <= booked for counts in reader_counts))
+
+    def test_concurrent_expiry_settlement_never_lands_in_the_ledger(self) -> None:
+        limiter = Limiter(self.clock)
+        limiter.configure("hot", {"capacity": 10, "refill_per_second": 0.0001})
+        ids = [limiter.reserve("hot", 1, ttl_seconds=10)["reservation_id"] for _ in range(10)]
+        self.clock.t += 10
+        errors: list[BaseException] = []
+
+        def finish(do_consume: bool, rid: str) -> None:
+            try:
+                if do_consume:
+                    limiter.consume(rid)
+                else:
+                    limiter.rollback(rid)
+                errors.append(AssertionError("expired reservation unexpectedly succeeded"))
+            except LimitNotFound:
+                pass
+            except BaseException as error:  # noqa: BLE001
+                errors.append(error)
+
+        def read_ledger() -> None:
+            try:
+                for _ in range(50):
+                    view = limiter.ledger("hot", 1000)
+                    if view["totals"] != {"accepted_count": 0, "accepted_cost": 0}:
+                        raise AssertionError("expiry posted a ledger event")
+            except BaseException as error:  # noqa: BLE001
+                errors.append(error)
+
+        threads = []
+        for index, rid in enumerate(ids):
+            threads.append(threading.Thread(target=finish, args=(True, rid)))
+            threads.append(threading.Thread(target=finish, args=(False, rid)))
+        threads += [threading.Thread(target=read_ledger) for _ in range(4)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(errors, [])
+        self.assertEqual(limiter.ledger("hot")["events"], [])
+        self.assertEqual((limiter.state("hot")["remaining"], limiter.state("hot")["used"]), (10, 0))
+
+
+class LedgerHttpTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        from quota import serve
+
+        cls.clock = Clock()
+        cls.server = serve(port=0, now=cls.clock)
+        cls.port = cls.server.server_address[1]
+        threading.Thread(target=cls.server.serve_forever, daemon=True).start()
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.server.shutdown()
+
+    def request(self, method: str, path: str, body: dict | None = None) -> tuple[int, dict, dict]:
+        data = None if body is None else json.dumps(body).encode()
+        request = urllib.request.Request(f"http://127.0.0.1:{self.port}{path}", data=data, method=method,
+                                         headers={"Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(request, timeout=5) as response:
+                return response.status, json.loads(response.read() or b"{}"), dict(response.headers)
+        except urllib.error.HTTPError as error:
+            return error.code, json.loads(error.read() or b"{}"), dict(error.headers)
+
+    def test_ledger_shape_for_a_check(self) -> None:
+        clock = type(self).clock
+        clock.t = 9000.0                                      # a fresh, dominant watermark
+        self.request("PUT", "/v1/limits/l-1", {"capacity": 5, "refill_per_second": 1})
+        self.request("POST", "/v1/check", {"key": "l-1", "cost": 2})
+        status, body, _ = self.request("GET", "/v1/ledgers/l-1")
+        self.assertEqual(status, 200)
+        self.assertEqual(body, {"key": "l-1",
+                                "totals": {"accepted_count": 1, "accepted_cost": 2},
+                                "events": [{"seq": 1, "source": "check", "reservation_id": None,
+                                            "cost": 2, "remaining": 3, "capacity": 5,
+                                            "effective_at": 9000.0}]})
+
+    def test_consume_event_and_totals_equal_limits_used(self) -> None:
+        self.request("PUT", "/v1/limits/l-2", {"capacity": 5, "refill_per_second": 1})
+        _, body, _ = self.request("POST", "/v1/reservations", {"key": "l-2", "cost": 3})
+        rid = body["reservation_id"]
+        self.assertEqual(self.request("POST", f"/v1/reservations/{rid}/consume", {})[0], 200)
+        status, ledger, _ = self.request("GET", "/v1/ledgers/l-2")
+        self.assertEqual(status, 200)
+        event, = ledger["events"]
+        self.assertEqual((event["source"], event["reservation_id"], event["cost"],
+                          event["remaining"], event["capacity"]),
+                         ("reservation_consume", rid, 3, 2, 5))
+        _, state, _ = self.request("GET", "/v1/limits/l-2")
+        self.assertEqual(ledger["totals"]["accepted_cost"], state["used"])
+        self.assertEqual(ledger["totals"]["accepted_count"], 1)
+
+    def test_unknown_key_ledger_is_404(self) -> None:
+        status, body, _ = self.request("GET", "/v1/ledgers/no-such-ledger")
+        self.assertEqual((status, body["error"]["code"]), (404, "not_found"))
+
+    def test_events_query_window_is_honoured(self) -> None:
+        self.request("PUT", "/v1/limits/l-3", {"capacity": 1000, "refill_per_second": 0.0001})
+        for _ in range(3):
+            self.request("POST", "/v1/check", {"key": "l-3"})
+        for path, expected in [("/v1/ledgers/l-3", [1, 2, 3]),
+                               ("/v1/ledgers/l-3?", [1, 2, 3]),
+                               ("/v1/ledgers/l-3?events=1000", [1, 2, 3]),
+                               ("/v1/ledgers/l-3?events=2", [2, 3]),
+                               ("/v1/ledgers/l-3?events=1", [3])]:
+            status, body, _ = self.request("GET", path)
+            self.assertEqual(status, 200, path)
+            self.assertEqual([event["seq"] for event in body["events"]], expected, path)
+            self.assertEqual(body["totals"], {"accepted_count": 3, "accepted_cost": 3})
+
+    def test_invalid_events_query_is_400(self) -> None:
+        self.request("PUT", "/v1/limits/l-4", {"capacity": 1, "refill_per_second": 1})
+        bad_paths = [
+            "/v1/ledgers/l-4?events=0", "/v1/ledgers/l-4?events=1001",
+            "/v1/ledgers/l-4?events=-1", "/v1/ledgers/l-4?events=1.5",
+            "/v1/ledgers/l-4?events=abc", "/v1/ledgers/l-4?events=true",
+            "/v1/ledgers/l-4?events=1x", "/v1/ledgers/l-4?events=",
+            "/v1/ledgers/l-4?events=1%20",
+            "/v1/ledgers/l-4?unknown=1", "/v1/ledgers/l-4?events=1&unknown=2",
+            "/v1/ledgers/l-4?events=1&events=2", "/v1/ledgers/l-4?&",
+        ]
+        for path in bad_paths:
+            status, body, _ = self.request("GET", path)
+            self.assertEqual((status, body["error"]["code"]), (400, "invalid_request"), path)
+
+    def test_invalid_query_beats_unknown_key(self) -> None:
+        status, body, _ = self.request("GET", "/v1/ledgers/missing-key?events=0")
+        self.assertEqual((status, body["error"]["code"]), (400, "invalid_request"))
+        status, body, _ = self.request("GET", "/v1/ledgers/missing-key?bogus=1")
+        self.assertEqual((status, body["error"]["code"]), (400, "invalid_request"))
+
+    def test_bad_routes_and_methods_are_404(self) -> None:
+        # Path/method mismatches stay 404 even with a query string that would be valid for ledgers.
+        self.assertEqual(self.request("GET", "/v1/ledgers")[0], 404)
+        self.assertEqual(self.request("GET", "/v1/ledgers/a/b")[0], 404)
+        self.assertEqual(self.request("GET", "/v1/nope?events=1")[0], 404)
+        self.assertEqual(self.request("POST", "/v1/ledgers/l-4", {})[0], 404)
+        self.assertEqual(self.request("PUT", "/v1/ledgers/l-4", {})[0], 404)
+        self.assertEqual(self.request("DELETE", "/v1/ledgers/l-4")[0], 404)
+        # Existing routes keep their old, query-agnostic behaviour.
+        self.assertEqual(self.request("GET", "/health?anything=1")[0], 200)
+
+    def test_ledger_read_is_still_empty_after_expiry_settlement(self) -> None:
+        self.request("PUT", "/v1/limits/l-5", {"capacity": 5, "refill_per_second": 0.0001})
+        _, body, _ = self.request("POST", "/v1/reservations",
+                                  {"key": "l-5", "cost": 3, "ttl_seconds": 10})
+        rid = body["reservation_id"]
+        type(self).clock.t += 10
+        status, ledger, _ = self.request("GET", "/v1/ledgers/l-5")
+        self.assertEqual(status, 200)
+        self.assertEqual(ledger["events"], [])                      # holds never post events
+        self.assertEqual(self.request("POST", f"/v1/reservations/{rid}/consume", {})[0], 404)
+        _, state, _ = self.request("GET", "/v1/limits/l-5")
+        self.assertEqual((state["remaining"], state["used"]), (5, 0))
+        _, ledger, _ = self.request("GET", "/v1/ledgers/l-5")
+        self.assertEqual((ledger["totals"], ledger["events"]),
+                         ({"accepted_count": 0, "accepted_cost": 0}, []))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -50,6 +50,24 @@ class Bucket:
     cost_history: list[float] = field(default_factory=list)
 
 
+@dataclass(frozen=True)
+class LedgerEvent:
+    """One accepted spend in a key's billing ledger: instant checks and confirmed reservations only."""
+
+    seq: int
+    source: str  # "check" | "reservation_consume"
+    reservation_id: str | None
+    cost: int
+    remaining: int
+    capacity: int
+    effective_at: float
+
+    def as_json(self) -> dict[str, Any]:
+        return {"seq": self.seq, "source": self.source, "reservation_id": self.reservation_id,
+                "cost": self.cost, "remaining": self.remaining, "capacity": self.capacity,
+                "effective_at": self.effective_at}
+
+
 @dataclass
 class Reservation:
     reservation_id: str
@@ -119,6 +137,10 @@ class Limiter:
         # Confirmed holds leave the active registry for good; the value is the exact first consume
         # response, replayed verbatim for idempotent retries (used is never booked a second time).
         self._consumed: dict[str, dict[str, Any]] = {}
+        # Append-only billing ledger per key: one entry per accepted check and per first consume.
+        # Entries are appended inside the lock at booking time, so seq is dense and gap-free even
+        # under concurrent settling; the list is never trimmed (read-only views take a tail slice).
+        self._ledgers: dict[str, list[LedgerEvent]] = {}
         # Highest clock reading ever observed; the effective moment never moves below it.
         self._watermark = float("-inf")
 
@@ -179,6 +201,18 @@ class Limiter:
         bucket.tokens = min(float(self._limits[key].capacity), bucket.tokens + returned)
         return returned
 
+    def _record_event(self, key: str, source: str, cost: int, reservation_id: str | None,
+                      remaining: float, capacity: int, effective_at: float) -> None:
+        """Append one accepted spend to the key's ledger. Caller holds the lock, booking just happened.
+
+        The new seq is len+1 computed inside the same critical section as the booking, so concurrent
+        bookings can neither skip nor reuse a number; totals derived from these entries therefore
+        never under- or over-count.
+        """
+        events = self._ledgers.setdefault(key, [])
+        events.append(LedgerEvent(len(events) + 1, source, reservation_id, cost,
+                                  int(remaining), capacity, effective_at))
+
     def check(self, key: Any, cost: Any) -> dict[str, Any]:
         cost = validate_cost(cost)
         with self._lock:
@@ -189,6 +223,7 @@ class Limiter:
             if bucket.tokens >= cost:
                 bucket.tokens -= cost
                 bucket.cost_history.append(cost)
+                self._record_event(key, "check", cost, None, bucket.tokens, limit.capacity, now)
                 return {"allowed": True, "remaining": int(bucket.tokens), "capacity": limit.capacity}
             deficit = cost - bucket.tokens
             retry_after = deficit / limit.refill_per_second
@@ -266,6 +301,8 @@ class Limiter:
             limit = self._limits[key]
             bucket = self._refill(key, now)
             bucket.cost_history.append(reservation.cost)
+            self._record_event(key, "reservation_consume", reservation.cost, reservation_id,
+                               bucket.tokens, limit.capacity, now)
             snapshot = {"reservation_id": reservation_id, "consumed": True,
                         "remaining": int(bucket.tokens), "capacity": limit.capacity,
                         "used": sum(bucket.cost_history)}
@@ -279,6 +316,27 @@ class Limiter:
             self._expire_due(key, now)
             bucket = self._refill(key, now)
             return {"limit": limit.as_json(), "remaining": int(bucket.tokens), "used": sum(bucket.cost_history)}
+
+    def ledger(self, key: str, event_limit: int = 100) -> dict[str, Any]:
+        """Read-only billing ledger: the accepted spends behind GET /v1/limits/{key}'s `used`.
+
+        Deliberately samples no clock and runs no settle/refill: a read never advances the
+        watermark, releases a hold, conjures tokens or books usage, so clock stalls or regressions
+        cannot cause early refunds or late postings through this entry point. Only the lock is taken
+        so the copy is consistent with concurrent check/reserve/consume/rollback/expiry work.
+        `event_limit` is assumed pre-validated as an int in 1..1000; the returned tail is ordered by
+        seq ascending while totals always cover the full append-only history.
+        """
+        with self._lock:
+            if key not in self._limits:
+                raise LimitNotFound(f"no limit configured for {key!r}")
+            events = self._ledgers.get(key, [])
+            return {
+                "key": key,
+                "totals": {"accepted_count": len(events),
+                           "accepted_cost": sum(event.cost for event in events)},
+                "events": [event.as_json() for event in events[-event_limit:]],
+            }
 
 
 def make_handler(limiter: Limiter) -> type[BaseHTTPRequestHandler]:
@@ -319,6 +377,30 @@ def make_handler(limiter: Limiter) -> type[BaseHTTPRequestHandler]:
         def _keys(self) -> list[str]:
             return [p for p in self.path.split("?")[0].split("/") if p]
 
+        def _ledger_event_limit(self) -> int:
+            """Parse the ledger endpoint's sole, optional `events` query parameter.
+
+            Anything but exactly one integer literal in 1..1000 named `events` — an unknown
+            parameter, a repeat, a blank/garbled value, a stray or empty pair — is invalid_request.
+            Only called once the /v1/ledgers/{key} route itself matches.
+            """
+            query = self.path.split("?", 1)[1] if "?" in self.path else ""
+            if query == "":
+                return 100
+            event_limit: int | None = None
+            for pair in query.split("&"):
+                name, separator, value = pair.partition("=")
+                if not separator or name != "events" or not value \
+                        or not all("0" <= char <= "9" for char in value):
+                    raise InvalidRequest("query string must be events=<integer 1..1000> and nothing else")
+                if event_limit is not None:
+                    raise InvalidRequest("events may be given at most once")
+                event_limit = int(value)
+                if not 1 <= event_limit <= 1000:
+                    raise InvalidRequest("events must be an integer between 1 and 1000")
+            assert event_limit is not None
+            return event_limit
+
         def do_GET(self) -> None:  # noqa: N802
             try:
                 parts = self._keys()
@@ -326,6 +408,11 @@ def make_handler(limiter: Limiter) -> type[BaseHTTPRequestHandler]:
                     return self._send(200, {"status": "ok"})
                 if len(parts) == 3 and parts[:2] == ["v1", "limits"]:
                     return self._send(200, limiter.state(parts[2]))
+                if len(parts) == 3 and parts[:2] == ["v1", "ledgers"]:
+                    # Route matched first: query validation now beats the key's 404, just as body
+                    # validation precedes quota classification everywhere else.
+                    event_limit = self._ledger_event_limit()
+                    return self._send(200, limiter.ledger(parts[2], event_limit))
                 return self._send(404, {"error": {"code": "not_found"}})
             except QuotaError as error:
                 return self._send(error.status, {"error": {"code": error.code, "message": str(error)}})
