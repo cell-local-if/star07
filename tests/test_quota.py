@@ -954,6 +954,95 @@ class ClockRegressionHttpTests(unittest.TestCase):
         self.assertEqual(state["remaining"], 10)
 
 
+class RetryAfterHttpTests(unittest.TestCase):
+    """429 Retry-After: one deterministic ceiling-to-millisecond rule for check and reservations."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        from quota import serve
+
+        cls.clock = Clock()
+        cls.server = serve(port=0, now=cls.clock)
+        cls.port = cls.server.server_address[1]
+        threading.Thread(target=cls.server.serve_forever, daemon=True).start()
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.server.shutdown()
+
+    def request(self, method: str, path: str, body: dict | None = None) -> tuple[int, dict, dict]:
+        data = None if body is None else json.dumps(body).encode()
+        request = urllib.request.Request(f"http://127.0.0.1:{self.port}{path}", data=data, method=method,
+                                         headers={"Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(request, timeout=5) as response:
+                return response.status, json.loads(response.read() or b"{}"), dict(response.headers)
+        except urllib.error.HTTPError as error:
+            return error.code, json.loads(error.read() or b"{}"), dict(error.headers)
+
+    def test_sub_millisecond_deficit_ceilings_up_not_to_zero(self) -> None:
+        clock = type(self).clock
+        clock.t = 8000.0
+        self.request("PUT", "/v1/limits/ra-1", {"capacity": 1, "refill_per_second": 1})
+        status, _, _ = self.request("POST", "/v1/check", {"key": "ra-1", "cost": 1})
+        self.assertEqual(status, 200)
+        clock.t += 0.9999                                          # deficit: 0.0001s at 1 token/s
+        status, body, headers = self.request("POST", "/v1/check", {"key": "ra-1", "cost": 1})
+        self.assertEqual((status, body["error"]["code"]), (429, "over_quota"))
+        self.assertEqual(headers["Retry-After"], "0.001")          # never 0.000
+
+    def test_check_and_reservation_share_the_same_hint(self) -> None:
+        clock = type(self).clock
+        clock.t = 5000.0
+        self.request("PUT", "/v1/limits/ra-2", {"capacity": 1, "refill_per_second": 0.3})
+        status, _, _ = self.request("POST", "/v1/reservations", {"key": "ra-2", "cost": 1})
+        self.assertEqual(status, 200)                              # bucket empty, deficit 1
+        # exact wait is 1/0.3 = 3.333...s: ceiling to milliseconds, identical on both routes.
+        expected = "3.334"
+        status, _, check_headers = self.request("POST", "/v1/check", {"key": "ra-2", "cost": 1})
+        self.assertEqual(status, 429)
+        status, _, reserve_headers = self.request("POST", "/v1/reservations", {"key": "ra-2", "cost": 1})
+        self.assertEqual(status, 429)
+        self.assertEqual(check_headers["Retry-After"], expected)
+        self.assertEqual(reserve_headers["Retry-After"], expected)
+        self.assertGreaterEqual(float(expected), 1 / 0.3)
+
+    def test_hint_covers_exact_wait_and_rejections_leave_no_trace(self) -> None:
+        clock = type(self).clock
+        clock.t = 6000.0
+        self.request("PUT", "/v1/limits/ra-3", {"capacity": 3, "refill_per_second": 0.7})
+        status, _, _ = self.request("POST", "/v1/check", {"key": "ra-3", "cost": 3})
+        self.assertEqual(status, 200)
+        clock.t += 2.0                                             # 1.4 tokens back, deficit 1.6
+        deficit, rate = 1.6, 0.7
+        for path, body in [("/v1/check", {"key": "ra-3", "cost": 3}),
+                           ("/v1/reservations", {"key": "ra-3", "cost": 3})]:
+            status, _, headers = self.request("POST", path, body)
+            self.assertEqual(status, 429)
+            hinted = float(headers["Retry-After"])
+            self.assertGreaterEqual(hinted, deficit / rate)
+            self.assertLess(hinted, deficit / rate + 0.001)        # ceiling, not padding
+        # Neither rejection deducted tokens, booked usage, or posted ledger events.
+        _, state, _ = self.request("GET", "/v1/limits/ra-3")
+        self.assertEqual((state["remaining"], state["used"]), (1, 3))
+        _, ledger, _ = self.request("GET", "/v1/ledgers/ra-3")
+        self.assertEqual(ledger["totals"], {"accepted_count": 1, "accepted_cost": 3})
+
+    def test_stalled_clock_keeps_the_hint_stable(self) -> None:
+        clock = type(self).clock
+        clock.t = 7000.0
+        self.request("PUT", "/v1/limits/ra-4", {"capacity": 1, "refill_per_second": 2})
+        self.request("POST", "/v1/check", {"key": "ra-4", "cost": 1})
+        first = self.request("POST", "/v1/check", {"key": "ra-4", "cost": 1})[2]["Retry-After"]
+        self.assertEqual(first, "0.500")
+        for _ in range(3):                                         # clock never advances
+            self.assertEqual(self.request("POST", "/v1/check", {"key": "ra-4", "cost": 1})[2]["Retry-After"],
+                             first)
+        clock.t = 6990.0                                           # regression: hint must not shrink
+        self.assertEqual(self.request("POST", "/v1/check", {"key": "ra-4", "cost": 1})[2]["Retry-After"],
+                         first)
+
+
 class LedgerUnitTests(unittest.TestCase):
     def setUp(self) -> None:
         self.clock = Clock()

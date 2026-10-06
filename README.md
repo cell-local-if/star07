@@ -35,7 +35,7 @@ PYTHONPATH=src python3 -m unittest discover -s tests -v
 ### `POST /v1/check`
 请求体：`{"key": <string>, "cost": <int 1..1000000，缺省 1>}`
 - 允许：`200 {"allowed": true, "remaining": <int 向下取整>, "capacity": <int>}`（并扣减令牌）。
-- 超限：**`429`** `{"error":{"code":"over_quota",...}}`，并带 **`Retry-After`**（秒，浮点，够补足 `cost` 的时间）。
+- 超限：**`429`** `{"error":{"code":"over_quota",...}}`，并带 **`Retry-After`**（秒，浮点；按当前 `refill_per_second` 计算并向上取整到毫秒，至少足够补足本次 `cost`，与 `POST /v1/reservations` 同一口径）。
 - 未配置的 key ⇒ `404 not_found`；`cost` 非法（含布尔值）⇒ `400 invalid_request`。
 
 ### `POST /v1/reservations`

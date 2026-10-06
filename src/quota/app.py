@@ -96,6 +96,17 @@ def validate_cost(cost: Any) -> int:
 DEFAULT_TTL_SECONDS = 60
 
 
+def retry_after_header(retry_after: float) -> str:
+    """The single Retry-After rule for every 429: raw seconds needed to refill this rejection's
+    cost at the current rate, rounded UP to whole milliseconds and rendered with three decimals.
+
+    Ceiling — never plain rounding or text truncation — keeps the hinted wait at or above the
+    exact deficit/rate, so a sub-millisecond shortfall still hints 0.001 rather than 0.000, and
+    every concurrent path that reaches the same rejection emits the identical value.
+    """
+    return f"{math.ceil(retry_after * 1000) / 1000:.3f}"
+
+
 def validate_ttl(ttl: Any) -> int:
     if not isinstance(ttl, int) or isinstance(ttl, bool) or ttl < 1 or ttl > 86_400:
         raise InvalidRequest("ttl_seconds must be an integer between 1 and 86400")
@@ -446,13 +457,7 @@ def make_handler(limiter: Limiter) -> type[BaseHTTPRequestHandler]:
                         raise InvalidRequest(
                             'body must be {"key": <string>, "cost": <integer>, "ttl_seconds": <integer 1..86400>}')
                     ttl = body.get("ttl_seconds", DEFAULT_TTL_SECONDS)
-                    try:
-                        result = limiter.reserve(body.get("key"), body.get("cost", 1), ttl)
-                    except OverQuota as error:
-                        # Round up to the millisecond so the value is always long enough to refill `cost`.
-                        retry_after = math.ceil(error.retry_after * 1000) / 1000
-                        return self._send(error.status, {"error": {"code": error.code, "message": str(error)}},
-                                          {"Retry-After": f"{retry_after:.3f}"})
+                    result = limiter.reserve(body.get("key"), body.get("cost", 1), ttl)
                     return self._send(200, result)
                 if len(parts) == 4 and parts[:2] == ["v1", "reservations"] and parts[3] == "consume":
                     body = self._read_json()
@@ -462,8 +467,9 @@ def make_handler(limiter: Limiter) -> type[BaseHTTPRequestHandler]:
                     return self._send(200, result)
                 return self._send(404, {"error": {"code": "not_found"}})
             except OverQuota as error:
+                # check and reservations share one deterministic ceiling-to-millisecond rule.
                 return self._send(error.status, {"error": {"code": error.code, "message": str(error)}},
-                                  {"Retry-After": f"{error.retry_after:.3f}"})
+                                  {"Retry-After": retry_after_header(error.retry_after)})
             except QuotaError as error:
                 return self._send(error.status, {"error": {"code": error.code, "message": str(error)}})
             except Exception:
