@@ -11,6 +11,7 @@ from .app import (  # noqa: F401
     QuotaError,
     Reservation,
     make_handler,
+    parse_after,
     serve,
     validate_cost,
     validate_key,
@@ -19,5 +20,5 @@ from .app import (  # noqa: F401
 )
 
 __all__ = ["Bucket", "DEFAULT_TTL_SECONDS", "InvalidRequest", "Limit", "LimitNotFound", "Limiter",
-           "OverQuota", "QuotaError", "Reservation", "make_handler", "serve", "validate_cost",
-           "validate_key", "validate_limit", "validate_ttl"]
+           "OverQuota", "QuotaError", "Reservation", "make_handler", "parse_after", "serve",
+           "validate_cost", "validate_key", "validate_limit", "validate_ttl"]

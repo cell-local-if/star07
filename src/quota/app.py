@@ -7,6 +7,7 @@ from __future__ import annotations
 import json
 import math
 import threading
+import urllib.parse
 import uuid
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -84,6 +85,32 @@ def validate_ttl(ttl: Any) -> int:
     return ttl
 
 
+MAX_AFTER = 2_147_483_647
+LEDGER_PAGE_SIZE = 100
+
+
+def parse_after(query: str) -> int:
+    """Validate the ledger query string and return the `after` cursor (0 when absent).
+
+    Only `after` is known; anything else is invalid_request. `after` must be a non-negative
+    ASCII decimal integer with no sign, decimal point or exponent, at most 2147483647.
+    """
+    after = 0
+    seen = False
+    for name, value in urllib.parse.parse_qsl(query, keep_blank_values=True):
+        if name != "after":
+            raise InvalidRequest(f"unknown query parameter: {name!r}")
+        if seen:
+            raise InvalidRequest("after may appear at most once")
+        seen = True
+        if not value or any(char not in "0123456789" for char in value):
+            raise InvalidRequest("after must be a non-negative decimal integer")
+        after = int(value)
+        if after > MAX_AFTER:
+            raise InvalidRequest(f"after must be at most {MAX_AFTER}")
+    return after
+
+
 def validate_limit(payload: Any) -> Limit:
     if not isinstance(payload, dict):
         raise InvalidRequest("body must be a JSON object")
@@ -110,6 +137,9 @@ class Limiter:
         # Confirmed holds leave the active registry for good; the value is the exact first consume
         # response, replayed verbatim for idempotent retries (used is never booked a second time).
         self._consumed: dict[str, dict[str, Any]] = {}
+        # Per-key billing ledger: accepted usage in booking order, sequence = index + 1. Lives
+        # outside Bucket so reconfiguring a key keeps both the events and the sequence running.
+        self._ledgers: dict[str, list[dict[str, Any]]] = {}
 
     def configure(self, key: Any, payload: Any) -> Limit:
         key = validate_key(key)
@@ -160,6 +190,13 @@ class Limiter:
         bucket.tokens = min(float(self._limits[key].capacity), bucket.tokens + returned)
         return returned
 
+    def _record_event(self, key: str, source: str, cost: int, used_after: int) -> None:
+        """Append one ledger event for `key`. Caller holds the lock; events are never mutated."""
+        events = self._ledgers.setdefault(key, [])
+        events.append({"sequence": len(events) + 1, "source": source, "cost": cost,
+                       "used_after": used_after, "event_id": uuid.uuid4().hex,
+                       "occurred_at": self._now()})
+
     def check(self, key: Any, cost: Any) -> dict[str, Any]:
         cost = validate_cost(cost)
         with self._lock:
@@ -169,6 +206,7 @@ class Limiter:
             if bucket.tokens >= cost:
                 bucket.tokens -= cost
                 bucket.cost_history.append(cost)
+                self._record_event(key, "check", cost, sum(bucket.cost_history))
                 return {"allowed": True, "remaining": int(bucket.tokens), "capacity": limit.capacity}
             deficit = cost - bucket.tokens
             retry_after = deficit / limit.refill_per_second
@@ -243,9 +281,11 @@ class Limiter:
             limit = self._limits[key]
             bucket = self._refill(key)
             bucket.cost_history.append(reservation.cost)
+            used = sum(bucket.cost_history)
+            self._record_event(key, "reservation_consume", reservation.cost, used)
             snapshot = {"reservation_id": reservation_id, "consumed": True,
                         "remaining": int(bucket.tokens), "capacity": limit.capacity,
-                        "used": sum(bucket.cost_history)}
+                        "used": used}
             self._consumed[reservation_id] = snapshot
             return dict(snapshot)
 
@@ -255,6 +295,22 @@ class Limiter:
             self._expire_due(key)
             bucket = self._refill(key)
             return {"limit": limit.as_json(), "remaining": int(bucket.tokens), "used": sum(bucket.cost_history)}
+
+    def ledger(self, key: str, after: int = 0) -> dict[str, Any]:
+        """Read-only billing ledger: accepted usage of `key` with sequence strictly above `after`.
+
+        Reading settles due reservations of the key first (the refund itself books no event).
+        At most one page of LEDGER_PAGE_SIZE events, ascending by sequence; next_after resumes
+        the scan, and equals the incoming `after` when the page is empty.
+        """
+        with self._lock:
+            if key not in self._limits:
+                raise LimitNotFound(f"no limit configured for {key!r}")
+            self._expire_due(key)
+            events = self._ledgers.get(key, [])
+            page = [dict(event) for event in events[after:after + LEDGER_PAGE_SIZE]]
+            return {"key": key, "events": page,
+                    "next_after": page[-1]["sequence"] if page else after}
 
 
 def make_handler(limiter: Limiter) -> type[BaseHTTPRequestHandler]:
@@ -302,6 +358,10 @@ def make_handler(limiter: Limiter) -> type[BaseHTTPRequestHandler]:
                     return self._send(200, {"status": "ok"})
                 if len(parts) == 3 and parts[:2] == ["v1", "limits"]:
                     return self._send(200, limiter.state(parts[2]))
+                if len(parts) == 4 and parts[:2] == ["v1", "limits"] and parts[3] == "ledger":
+                    query = self.path.split("?", 1)[1] if "?" in self.path else ""
+                    after = parse_after(query)
+                    return self._send(200, limiter.ledger(parts[2], after))
                 return self._send(404, {"error": {"code": "not_found"}})
             except QuotaError as error:
                 return self._send(error.status, {"error": {"code": error.code, "message": str(error)}})
