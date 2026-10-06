@@ -52,10 +52,11 @@ class Bucket:
 
 @dataclass(frozen=True)
 class LedgerEvent:
-    """One accepted spend in a key's billing ledger: instant checks and confirmed reservations only."""
+    """One accepted spend in a key's billing ledger: instant checks, hierarchy checks and
+    confirmed reservations only."""
 
     seq: int
-    source: str  # "check" | "reservation_consume"
+    source: str  # "check" | "hierarchy_check" | "reservation_consume"
     reservation_id: str | None
     cost: int
     remaining: int
@@ -110,6 +111,21 @@ def validate_cost(cost: Any) -> int:
     if not isinstance(cost, int) or isinstance(cost, bool) or cost < 1 or cost > 1_000_000:
         raise InvalidRequest("cost must be an integer between 1 and 1000000")
     return cost
+
+
+def validate_keys(keys: Any) -> list[str]:
+    """The hierarchy endpoint's ordered parent-to-leaf key list: 2..20 distinct keys, each
+    passing the same key rule as configure/check. Anything else is invalid_request and the
+    request never reaches the lock."""
+    if not isinstance(keys, list) or not 2 <= len(keys) <= 20:
+        raise InvalidRequest("keys must be a list of 2 to 20 distinct key strings")
+    seen: set[str] = set()
+    for key in keys:
+        validate_key(key)
+        if key in seen:
+            raise InvalidRequest("keys must not contain duplicates")
+        seen.add(key)
+    return list(keys)
 
 
 DEFAULT_TTL_SECONDS = 60
@@ -280,6 +296,46 @@ class Limiter:
             deficit = cost - bucket.tokens
             retry_after = deficit / limit.refill_per_second
             raise OverQuota(f"key {key!r} has {bucket.tokens:.3f} tokens, needs {cost}", retry_after)
+
+    def hierarchy_check(self, keys: Any, cost: Any) -> dict[str, Any]:
+        """Atomically deduct `cost` from every layer of an ordered parent-to-leaf hierarchy.
+
+        Same critical section, same single effective moment as check(): validation happens before
+        the lock, then every layer's due reservations are settled and its bucket refilled at this
+        one moment, and only then is affordability judged. The decision is all-or-nothing — either
+        every layer can pay and all are deducted and booked together, or none is touched (beyond
+        the lazy expiry settle every entry point performs) and the rejection hints the longest
+        wait any insufficient layer needs to cover its own deficit.
+        """
+        keys = validate_keys(keys)
+        cost = validate_cost(cost)
+        with self._lock:
+            now = self._tick()
+            # Configuration is validated for every layer, in input order, before any settle or
+            # deduction: the 404 names the first unconfigured key and no layer's state changes.
+            for key in keys:
+                if key not in self._limits:
+                    raise LimitNotFound(f"no limit configured for {key!r}")
+            buckets = []
+            for key in keys:
+                self._expire_due(key, now)
+                buckets.append(self._refill(key, now))
+            shortfalls = [(key, bucket) for key, bucket in zip(keys, buckets) if bucket.tokens < cost]
+            if shortfalls:
+                retry_after = max((cost - bucket.tokens) / self._limits[key].refill_per_second
+                                  for key, bucket in shortfalls)
+                raise OverQuota(
+                    f"hierarchy layers short of cost {cost}: "
+                    + ", ".join(f"{key!r} has {bucket.tokens:.3f}" for key, bucket in shortfalls),
+                    retry_after)
+            layers = []
+            for key, bucket in zip(keys, buckets):
+                bucket.tokens -= cost
+                bucket.cost_history.append(cost)
+                limit = self._limits[key]
+                self._record_event(key, "hierarchy_check", cost, None, bucket.tokens, limit.capacity, now)
+                layers.append({"key": key, "remaining": int(bucket.tokens), "capacity": limit.capacity})
+            return {"allowed": True, "cost": cost, "layers": layers}
 
     def reserve(self, key: Any, cost: Any, ttl_seconds: Any = DEFAULT_TTL_SECONDS) -> dict[str, Any]:
         """Atomically hold `cost` tokens, exactly as check() judges them, without booking them as used.
@@ -601,6 +657,12 @@ def make_handler(limiter: Limiter) -> type[BaseHTTPRequestHandler]:
                     if not isinstance(body, dict) or set(body) - {"key", "cost"}:
                         raise InvalidRequest("body must be {\"key\": <string>, \"cost\": <integer>}")
                     result = limiter.check(body.get("key"), body.get("cost", 1))
+                    return self._send(200, result)
+                if parts == ["v1", "hierarchies", "check"]:
+                    body = self._read_json()
+                    if not isinstance(body, dict) or "keys" not in body or set(body) - {"keys", "cost"}:
+                        raise InvalidRequest('body must be {"keys": [<string>, ...], "cost": <integer>}')
+                    result = limiter.hierarchy_check(body["keys"], body.get("cost", 1))
                     return self._send(200, result)
                 if parts == ["v1", "reservations"]:
                     body = self._read_json()
