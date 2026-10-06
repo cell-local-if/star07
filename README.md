@@ -35,7 +35,7 @@ PYTHONPATH=src python3 -m unittest discover -s tests -v
 ### `POST /v1/check`
 请求体：`{"key": <string>, "cost": <int 1..1000000，缺省 1>}`
 - 允许：`200 {"allowed": true, "remaining": <int 向下取整>, "capacity": <int>}`（并扣减令牌）。
-- 超限：**`429`** `{"error":{"code":"over_quota",...}}`，并带 **`Retry-After`**（秒，浮点，够补足 `cost` 的时间）。
+- 超限：**`429`** `{"error":{"code":"over_quota",...}}`，并带 **`Retry-After`**（秒，响应头输出三位小数；按当前 `refill_per_second` 计算并向上取整到毫秒，至少足够补足本次 `cost`）。
 - 未配置的 key ⇒ `404 not_found`；`cost` 非法（含布尔值）⇒ `400 invalid_request`。
 
 ### `POST /v1/reservations`
@@ -49,7 +49,7 @@ PYTHONPATH=src python3 -m unittest discover -s tests -v
 - 与 `check` 共用同一把锁、同一套原子额度判断：并发的检查、预留、到期释放与回滚不会超卖，也不会双重返还。
 - 未配置的 key ⇒ `404 not_found`；key/cost/`ttl_seconds` 非法（含布尔值；`ttl_seconds` 须为 1..86400 的整数）⇒ `400 invalid_request`，
   且不创建预留、不扣减令牌。
-- 令牌不足 ⇒ `429 over_quota` 并带 **`Retry-After`**（秒，浮点；按当前 `refill_per_second` 计算并向上取整到毫秒，至少足够补足本次 `cost`）。
+- 令牌不足 ⇒ `429 over_quota` 并带 **`Retry-After`**（秒，响应头输出三位小数；按当前 `refill_per_second` 计算并向上取整到毫秒，至少足够补足本次 `cost`；与 `POST /v1/check` 的 429 完全同一口径）。
 
 ### `DELETE /v1/reservations/{reservation_id}`
 对**尚未过期且未回滚**的预留执行**一次**撤销：把预留扣掉的 `cost` 放回该 key 当前桶，并按当前 `capacity` 封顶（返还前也先按时间补充）。

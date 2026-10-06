@@ -34,6 +34,17 @@ class OverQuota(QuotaError):
         self.retry_after = retry_after
 
 
+def retry_after_seconds(deficit: float, refill_per_second: float) -> float:
+    """The single Retry-After basis for every 429: exact wait to refill `deficit`, ceiled to ms.
+
+    Computed once, inside the quota critical section at the moment of the rejection, so concurrent
+    check/reserve/expiry/rollback paths can never report the same shortfall at different precisions.
+    The millisecond ceiling (not rounding) guarantees the hinted wait is never shorter than the
+    exact deficit/rate quotient: a 0.0001s shortfall at rate 1 hints 0.001, never 0.000.
+    """
+    return math.ceil(deficit / refill_per_second * 1000) / 1000
+
+
 @dataclass
 class Limit:
     capacity: int
@@ -226,7 +237,7 @@ class Limiter:
                 self._record_event(key, "check", cost, None, bucket.tokens, limit.capacity, now)
                 return {"allowed": True, "remaining": int(bucket.tokens), "capacity": limit.capacity}
             deficit = cost - bucket.tokens
-            retry_after = deficit / limit.refill_per_second
+            retry_after = retry_after_seconds(deficit, limit.refill_per_second)
             raise OverQuota(f"key {key!r} has {bucket.tokens:.3f} tokens, needs {cost}", retry_after)
 
     def reserve(self, key: Any, cost: Any, ttl_seconds: Any = DEFAULT_TTL_SECONDS) -> dict[str, Any]:
@@ -246,7 +257,7 @@ class Limiter:
             if bucket.tokens < cost:
                 deficit = cost - bucket.tokens
                 raise OverQuota(f"key {key!r} has {bucket.tokens:.3f} tokens, needs {cost}",
-                                deficit / limit.refill_per_second)
+                                retry_after_seconds(deficit, limit.refill_per_second))
             bucket.tokens -= cost
             reservation = Reservation(uuid.uuid4().hex, key, cost, now, ttl_seconds)
             self._reservations[reservation.reservation_id] = reservation
@@ -446,13 +457,7 @@ def make_handler(limiter: Limiter) -> type[BaseHTTPRequestHandler]:
                         raise InvalidRequest(
                             'body must be {"key": <string>, "cost": <integer>, "ttl_seconds": <integer 1..86400>}')
                     ttl = body.get("ttl_seconds", DEFAULT_TTL_SECONDS)
-                    try:
-                        result = limiter.reserve(body.get("key"), body.get("cost", 1), ttl)
-                    except OverQuota as error:
-                        # Round up to the millisecond so the value is always long enough to refill `cost`.
-                        retry_after = math.ceil(error.retry_after * 1000) / 1000
-                        return self._send(error.status, {"error": {"code": error.code, "message": str(error)}},
-                                          {"Retry-After": f"{retry_after:.3f}"})
+                    result = limiter.reserve(body.get("key"), body.get("cost", 1), ttl)
                     return self._send(200, result)
                 if len(parts) == 4 and parts[:2] == ["v1", "reservations"] and parts[3] == "consume":
                     body = self._read_json()
@@ -462,6 +467,8 @@ def make_handler(limiter: Limiter) -> type[BaseHTTPRequestHandler]:
                     return self._send(200, result)
                 return self._send(404, {"error": {"code": "not_found"}})
             except OverQuota as error:
+                # retry_after is already ceiled to whole milliseconds inside the limiter, so both
+                # 429 routes emit the identical three-decimal hint for the identical shortfall.
                 return self._send(error.status, {"error": {"code": error.code, "message": str(error)}},
                                   {"Retry-After": f"{error.retry_after:.3f}"})
             except QuotaError as error:
