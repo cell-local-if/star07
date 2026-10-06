@@ -33,10 +33,11 @@ PYTHONPATH=src python3 -m unittest discover -s tests -v
 - 未知字段/非法值 ⇒ `400 invalid_request`。
 
 ### `POST /v1/check`
-请求体：`{"key": <string>, "cost": <int 1..1000000，缺省 1>}`
+请求体：`{"key": <string 非空 ≤200 字符>, "cost": <int 1..1000000，缺省 1>}`
 - 允许：`200 {"allowed": true, "remaining": <int 向下取整>, "capacity": <int>}`（并扣减令牌）。
 - 超限：**`429`** `{"error":{"code":"over_quota",...}}`，并带 **`Retry-After`**（秒，浮点；按当前 `refill_per_second` 计算并向上取整到毫秒，至少足够补足本次 `cost`，与 `POST /v1/reservations` 同一口径）。
-- 未配置的 key ⇒ `404 not_found`；`cost` 非法（含布尔值）⇒ `400 invalid_request`。
+- 未配置的 key ⇒ `404 not_found`；key 非法（非字符串、空串、超过 200 字符）或 `cost` 非法（含布尔值）⇒ `400 invalid_request`，
+  且不采样时钟、不补充、不扣减、不生成账本事件；key 与 cost 同时非法时同样返回 `invalid_request`。
 
 ### `POST /v1/reservations`
 预留（占用但不记为已消耗）。请求体：`{"key": <string 非空 ≤200 字符>, "cost": <int 1..1000000，缺省 1>, "ttl_seconds": <int 1..86400，缺省 60>}`。
@@ -99,6 +100,10 @@ PYTHONPATH=src python3 -m unittest discover -s tests -v
 ```
 
 优先级：`Content-Length` 校验先于读体；路由不匹配先于体校验；`invalid_request` 先于 `not_found`/`over_quota`。
+
+路由按**非空斜杠段精确匹配**：连续斜杠、首尾多余斜杠、额外段 ⇒ `404 not_found`（不会因忽略空段而命中现有端点）；
+已知路径上使用不支持的方法同样 ⇒ `404 not_found`，且方法/路径分类优先于 `Content-Length`、JSON 与字段校验，
+被拒绝的请求不读取请求体、不改变任何状态。仅 `GET /v1/ledgers/{key}` 校验查询串，其余端点忽略查询参数。
 
 ## 未实现（后续任务候选，非固定题单）
 

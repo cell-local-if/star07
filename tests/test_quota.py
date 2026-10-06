@@ -1439,5 +1439,218 @@ class LedgerHttpTests(unittest.TestCase):
                          ({"accepted_count": 0, "accepted_cost": 0}, []))
 
 
+class CheckKeyValidationUnitTests(unittest.TestCase):
+    """Limiter.check applies the same key rule as configure/reserve, before any state or clock work."""
+
+    def setUp(self) -> None:
+        self.clock = Clock()
+        self.limiter = Limiter(self.clock)
+        self.limiter.configure("tenant-a", {"capacity": 3, "refill_per_second": 1.0})
+
+    def test_invalid_keys_are_invalid_request_and_never_sample_the_clock(self) -> None:
+        watermark = self.limiter._watermark                     # pinned by configure
+        for bad_key in [1, 0, True, False, None, "", "x" * 201, ["tenant-a"],
+                        {"key": "tenant-a"}, 1.5, b"tenant-a", (2, 3)]:
+            with self.assertRaises(InvalidRequest, msg=repr(bad_key)):
+                self.limiter.check(bad_key, 1)
+        # No tick, no refill, no deduction, no ledger event.
+        self.assertEqual(self.limiter._watermark, watermark)
+        state = self.limiter.state("tenant-a")
+        self.assertEqual((state["remaining"], state["used"]), (3, 0))
+        self.assertEqual(self.limiter.ledger("tenant-a")["events"], [])
+
+    def test_invalid_keys_change_nothing_when_the_clock_stalls_or_regresses(self) -> None:
+        self.assertTrue(self.limiter.check("tenant-a", 3)["allowed"])   # empty bucket, used 3
+        self.clock.t -= 500.0                                           # regression
+        for bad_key in [None, "", 7, "y" * 201, [], {}]:
+            with self.assertRaises(InvalidRequest):
+                self.limiter.check(bad_key, 1)
+        state = self.limiter.state("tenant-a")                          # effective moment = watermark
+        self.assertEqual((state["remaining"], state["used"]), (0, 3))
+        self.clock.t += 500.0                                           # stalled at the same reading
+        for bad_key in [True, b"x", ""]:
+            with self.assertRaises(InvalidRequest):
+                self.limiter.check(bad_key, 1)
+        state = self.limiter.state("tenant-a")
+        self.assertEqual((state["remaining"], state["used"]), (0, 3))
+        self.assertEqual(self.limiter.ledger("tenant-a")["totals"],
+                         {"accepted_count": 1, "accepted_cost": 3})
+
+    def test_invalid_checks_leave_reservations_untouched(self) -> None:
+        reservation = self.limiter.reserve("tenant-a", 2, ttl_seconds=60)   # tokens 1
+        for bad_key in [None, "", 5, ["tenant-a"]]:
+            with self.assertRaises(InvalidRequest):
+                self.limiter.check(bad_key, 1)
+        self.assertIn(reservation["reservation_id"], self.limiter._reservations)
+        state = self.limiter.state("tenant-a")
+        self.assertEqual((state["remaining"], state["used"]), (1, 0))
+
+    def test_invalid_key_and_cost_together_is_still_invalid_request(self) -> None:
+        for bad_key, bad_cost in [(None, 0), ("", True), (1, "x"), ("x" * 201, -1), ([], None)]:
+            with self.assertRaises(InvalidRequest):
+                self.limiter.check(bad_key, bad_cost)
+        self.assertEqual(self.limiter.state("tenant-a")["remaining"], 3)
+
+    def test_valid_but_unconfigured_key_is_not_found_and_boundary_keys_pass(self) -> None:
+        with self.assertRaises(LimitNotFound):
+            self.limiter.check("tenant-absent", 1)
+        self.limiter.configure("x" * 200, {"capacity": 1, "refill_per_second": 1.0})
+        self.assertTrue(self.limiter.check("x" * 200, 1)["allowed"])    # 200 chars: accepted
+        self.assertTrue(self.limiter.check("tenant-a", 1)["allowed"])   # normal path intact
+
+
+class CheckKeyHttpTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        from quota import serve
+
+        cls.clock = Clock()
+        cls.server = serve(port=0, now=cls.clock)
+        cls.port = cls.server.server_address[1]
+        threading.Thread(target=cls.server.serve_forever, daemon=True).start()
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.server.shutdown()
+
+    def request(self, method: str, path: str, body: dict | None = None) -> tuple[int, dict, dict]:
+        data = None if body is None else json.dumps(body).encode()
+        request = urllib.request.Request(f"http://127.0.0.1:{self.port}{path}", data=data, method=method,
+                                         headers={"Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(request, timeout=5) as response:
+                return response.status, json.loads(response.read() or b"{}"), dict(response.headers)
+        except urllib.error.HTTPError as error:
+            return error.code, json.loads(error.read() or b"{}"), dict(error.headers)
+
+    def test_invalid_keys_are_400_and_leave_no_trace(self) -> None:
+        self.request("PUT", "/v1/limits/ck-1", {"capacity": 2, "refill_per_second": 1})
+        for bad_key in [1, True, None, "", "x" * 201, ["ck-1"], {"k": 1}, 1.5]:
+            status, body, _ = self.request("POST", "/v1/check", {"key": bad_key, "cost": 1})
+            self.assertEqual((status, body["error"]["code"]), (400, "invalid_request"), repr(bad_key))
+        _, state, _ = self.request("GET", "/v1/limits/ck-1")
+        self.assertEqual((state["remaining"], state["used"]), (2, 0))
+        _, ledger, _ = self.request("GET", "/v1/ledgers/ck-1")
+        self.assertEqual(ledger["totals"], {"accepted_count": 0, "accepted_cost": 0})
+        self.assertEqual(ledger["events"], [])
+
+    def test_invalid_key_and_cost_together_is_400_not_404(self) -> None:
+        # Both fields illegal and the key unconfigured: validation still wins over not_found.
+        status, body, _ = self.request("POST", "/v1/check", {"key": None, "cost": 0})
+        self.assertEqual((status, body["error"]["code"]), (400, "invalid_request"))
+        status, body, _ = self.request("POST", "/v1/check", {"key": "", "cost": True})
+        self.assertEqual((status, body["error"]["code"]), (400, "invalid_request"))
+
+    def test_unknown_key_over_quota_and_success_contract_are_unchanged(self) -> None:
+        status, body, _ = self.request("POST", "/v1/check", {"key": "ck-absent"})
+        self.assertEqual((status, body["error"]["code"]), (404, "not_found"))
+        self.request("PUT", "/v1/limits/ck-2", {"capacity": 1, "refill_per_second": 2})
+        status, body, _ = self.request("POST", "/v1/check", {"key": "ck-2"})
+        self.assertEqual((status, body), (200, {"allowed": True, "remaining": 0, "capacity": 1}))
+        status, body, headers = self.request("POST", "/v1/check", {"key": "ck-2"})
+        self.assertEqual((status, body["error"]["code"]), (429, "over_quota"))
+        self.assertEqual(headers["Retry-After"], "0.500")
+
+
+class StrictRoutingHttpTests(unittest.TestCase):
+    """Paths match the public contract segment-for-segment; unsupported methods are 404."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        import http.client
+
+        cls.http_client = http.client
+        from quota import serve
+
+        cls.clock = Clock()
+        cls.server = serve(port=0, now=cls.clock)
+        cls.port = cls.server.server_address[1]
+        threading.Thread(target=cls.server.serve_forever, daemon=True).start()
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.server.shutdown()
+
+    def request(self, method: str, path: str, body: dict | None = None) -> tuple[int, dict, dict]:
+        data = None if body is None else json.dumps(body).encode()
+        request = urllib.request.Request(f"http://127.0.0.1:{self.port}{path}", data=data, method=method,
+                                         headers={"Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(request, timeout=5) as response:
+                return response.status, json.loads(response.read() or b"{}"), dict(response.headers)
+        except urllib.error.HTTPError as error:
+            return error.code, json.loads(error.read() or b"{}"), dict(error.headers)
+
+    def raw_request(self, method: str, path: str, payload: bytes | None) -> tuple[int, dict]:
+        connection = self.http_client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        connection.putrequest(method, path)
+        connection.putheader("Content-Length", str(len(payload or b"")))
+        connection.endheaders(payload or b"")
+        response = connection.getresponse()
+        body = json.loads(response.read() or b"{}")
+        connection.close()
+        return response.status, body
+
+    def test_empty_or_extra_segments_never_alias_real_routes(self) -> None:
+        self.request("PUT", "/v1/limits/sr-1", {"capacity": 2, "refill_per_second": 1})
+        bad_paths = [
+            "//health", "/health/", "//v1/check", "/v1//check", "/v1/check/", "/v1/check/extra",
+            "/v1//limits/sr-1", "/v1/limits//sr-1", "/v1/limits/sr-1/", "/v1/limits/sr-1/extra",
+            "/v1//ledgers/sr-1", "/v1/ledgers/sr-1/", "/v1//reservations", "/v1/reservations/",
+            "/v1/reservations//consume", "/v1/reservations/some-id/consume/",
+            "/v1/reservations/some-id//consume", "/v1/reservations/some-id/consume/extra",
+        ]
+        for path in bad_paths:
+            for method in ["GET", "POST", "PUT", "DELETE"]:
+                status, body = self.raw_request(method, path, b"{}")
+                self.assertEqual((status, body["error"]["code"]), (404, "not_found"), (method, path))
+        # The malformed probes changed nothing: the real routes still work on a full bucket.
+        _, state, _ = self.request("GET", "/v1/limits/sr-1")
+        self.assertEqual((state["remaining"], state["used"]), (2, 0))
+
+    def test_unsupported_methods_on_known_paths_are_404(self) -> None:
+        for method, path, body in [("GET", "/v1/check", None),
+                                   ("PUT", "/v1/check", {"key": "sr-1"}),
+                                   ("DELETE", "/v1/check", None),
+                                   ("PATCH", "/v1/check", {"key": "sr-1"}),
+                                   ("PATCH", "/health", None),
+                                   ("OPTIONS", "/v1/limits/sr-1", None),
+                                   ("POST", "/health", {}),
+                                   ("POST", "/v1/limits/sr-1", {"capacity": 1, "refill_per_second": 1}),
+                                   ("PUT", "/v1/reservations", {"key": "sr-1"}),
+                                   ("GET", "/v1/reservations/some-id/consume", None)]:
+            self.assertEqual(self.request(method, path, body)[0], 404, (method, path))
+        status, _ = self.raw_request("HEAD", "/health", None)
+        self.assertEqual(status, 404)
+        status, _ = self.raw_request("TRACE", "/v1/check", None)
+        self.assertEqual(status, 404)
+
+    def test_route_and_method_mismatch_beats_body_validation_and_changes_nothing(self) -> None:
+        self.request("PUT", "/v1/limits/sr-2", {"capacity": 2, "refill_per_second": 1})
+        # Garbage bodies — invalid JSON, wrong shape, bogus key — on mismatched routes/methods: 404.
+        for method, path, payload in [("POST", "/v1//check", b'{"key": null, "cost": 0}'),
+                                      ("POST", "/v1/check/", b"not json"),
+                                      ("PATCH", "/v1/check", b'{"key": 1'),
+                                      ("PUT", "/v1/reservations", b"[]"),
+                                      ("DELETE", "/v1/limits/sr-2", b"{"),
+                                      ("POST", "/v1/reservations//consume", b"")]:
+            status, body = self.raw_request(method, path, payload)
+            self.assertEqual((status, body["error"]["code"]), (404, "not_found"), (method, path))
+        _, state, _ = self.request("GET", "/v1/limits/sr-2")
+        self.assertEqual((state["remaining"], state["used"]), (2, 0))
+        _, ledger, _ = self.request("GET", "/v1/ledgers/sr-2")
+        self.assertEqual(ledger["totals"], {"accepted_count": 0, "accepted_cost": 0})
+
+    def test_existing_routes_and_query_behaviour_are_unchanged(self) -> None:
+        self.assertEqual(self.request("GET", "/health?anything=1")[0], 200)
+        self.request("PUT", "/v1/limits/sr-3", {"capacity": 1, "refill_per_second": 1})
+        self.assertEqual(self.request("GET", "/v1/limits/sr-3?ignored=1")[0], 200)
+        status, body, _ = self.request("POST", "/v1/check?ignored=1", {"key": "sr-3"})
+        self.assertEqual((status, body["allowed"]), (200, True))
+        # Only the ledger endpoint validates its query string.
+        status, body, _ = self.request("GET", "/v1/ledgers/sr-3?events=0")
+        self.assertEqual((status, body["error"]["code"]), (400, "invalid_request"))
+
+
 if __name__ == "__main__":
     unittest.main()

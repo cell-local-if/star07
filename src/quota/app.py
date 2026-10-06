@@ -225,6 +225,9 @@ class Limiter:
                                   int(remaining), capacity, effective_at))
 
     def check(self, key: Any, cost: Any) -> dict[str, Any]:
+        # Same key rule as configure/reserve, enforced before the lock and the clock
+        # sample: a rejected check never ticks, refills, deducts, or posts a ledger event.
+        key = validate_key(key)
         cost = validate_cost(cost)
         with self._lock:
             now = self._tick()
@@ -358,6 +361,22 @@ def make_handler(limiter: Limiter) -> type[BaseHTTPRequestHandler]:
         def log_message(self, *args: Any) -> None:
             return
 
+        def parse_request(self) -> bool:
+            """Keep a leading '//' in the path intact.
+
+            The framework's parse_request collapses '//x' to '/x' (open-redirect
+            hardening), which would alias '//v1/check' onto the real '/v1/check'
+            route. The strict route contract classifies it as not_found instead,
+            so the raw target is restored after the standard parsing.
+            """
+            words = str(self.raw_requestline, "iso-8859-1").rstrip("\r\n").split()
+            raw_target = words[1] if len(words) >= 2 else ""
+            if not super().parse_request():
+                return False
+            if raw_target.startswith("//"):
+                self.path = raw_target
+            return True
+
         def _send(self, status: int, body: dict[str, Any], headers: dict[str, str] | None = None) -> None:
             raw = json.dumps(body).encode("utf-8")
             self.send_response(status)
@@ -366,7 +385,8 @@ def make_handler(limiter: Limiter) -> type[BaseHTTPRequestHandler]:
             for name, value in (headers or {}).items():
                 self.send_header(name, value)
             self.end_headers()
-            self.wfile.write(raw)
+            if self.command != "HEAD":
+                self.wfile.write(raw)
 
         def _read_json(self) -> Any:
             length = self.headers.get("Content-Length")
@@ -385,8 +405,17 @@ def make_handler(limiter: Limiter) -> type[BaseHTTPRequestHandler]:
             except (UnicodeDecodeError, json.JSONDecodeError) as error:
                 raise InvalidRequest("body must be valid UTF-8 JSON") from error
 
-        def _keys(self) -> list[str]:
-            return [p for p in self.path.split("?")[0].split("/") if p]
+        def _keys(self) -> list[str] | None:
+            """Strict public-contract segments: exactly one leading slash, every segment non-empty.
+
+            Returns None — the path matches no route at all — when it has consecutive
+            slashes, a trailing slash, or no leading slash. Filtering empty segments
+            instead would let malformed paths alias real endpoints.
+            """
+            segments = self.path.split("?")[0].split("/")
+            if segments[0] != "" or any(segment == "" for segment in segments[1:]):
+                return None
+            return segments[1:]
 
         def _ledger_event_limit(self) -> int:
             """Parse the ledger endpoint's sole, optional `events` query parameter.
@@ -414,7 +443,7 @@ def make_handler(limiter: Limiter) -> type[BaseHTTPRequestHandler]:
 
         def do_GET(self) -> None:  # noqa: N802
             try:
-                parts = self._keys()
+                parts = self._keys() or []
                 if parts == ["health"]:
                     return self._send(200, {"status": "ok"})
                 if len(parts) == 3 and parts[:2] == ["v1", "limits"]:
@@ -432,7 +461,7 @@ def make_handler(limiter: Limiter) -> type[BaseHTTPRequestHandler]:
 
         def do_PUT(self) -> None:  # noqa: N802
             try:
-                parts = self._keys()
+                parts = self._keys() or []
                 if len(parts) != 3 or parts[:2] != ["v1", "limits"]:
                     return self._send(404, {"error": {"code": "not_found"}})
                 limit = limiter.configure(parts[2], self._read_json())
@@ -444,7 +473,7 @@ def make_handler(limiter: Limiter) -> type[BaseHTTPRequestHandler]:
 
         def do_POST(self) -> None:  # noqa: N802
             try:
-                parts = self._keys()
+                parts = self._keys() or []
                 if parts == ["v1", "check"]:
                     body = self._read_json()
                     if not isinstance(body, dict) or set(body) - {"key", "cost"}:
@@ -477,7 +506,7 @@ def make_handler(limiter: Limiter) -> type[BaseHTTPRequestHandler]:
 
         def do_DELETE(self) -> None:  # noqa: N802
             try:
-                parts = self._keys()
+                parts = self._keys() or []
                 if len(parts) != 3 or parts[:2] != ["v1", "reservations"]:
                     return self._send(404, {"error": {"code": "not_found"}})
                 result = limiter.rollback(parts[2])
@@ -486,6 +515,15 @@ def make_handler(limiter: Limiter) -> type[BaseHTTPRequestHandler]:
                 return self._send(error.status, {"error": {"code": error.code, "message": str(error)}})
             except Exception:
                 return self._send(500, {"error": {"code": "internal_error"}})
+
+        def do_HEAD(self) -> None:  # noqa: N802
+            # Unsupported method on any path: the same not_found classification as a
+            # route mismatch, and it never looks at the (unread) request body.
+            self._send(404, {"error": {"code": "not_found"}})
+
+        do_OPTIONS = do_HEAD  # noqa: N802
+        do_PATCH = do_HEAD  # noqa: N802
+        do_TRACE = do_HEAD  # noqa: N802
 
     return Handler
 
