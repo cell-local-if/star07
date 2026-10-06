@@ -8,6 +8,7 @@ import json
 import math
 import threading
 import uuid
+from bisect import bisect_right
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable
@@ -81,6 +82,25 @@ class Reservation:
         return self.created_at + self.ttl_seconds
 
 
+@dataclass
+class Window:
+    """One precise sliding-window limiter per key: the configuration plus its admission log.
+
+    `events` holds the effective moments (watermark clock) of the admitted checks still in or
+    near the window, in non-decreasing order: admissions always happen at the high-water mark,
+    which never moves backwards, so appends keep the list sorted and `events[0]` after pruning
+    is always the earliest live event. Windows share the process memory and the lock with the
+    token buckets but nothing else — a key's window and its bucket are fully independent.
+    """
+
+    window_seconds: int
+    max_events: int
+    events: list[float] = field(default_factory=list)
+
+    def as_json(self) -> dict[str, Any]:
+        return {"window_seconds": self.window_seconds, "max_events": self.max_events}
+
+
 def validate_key(key: Any) -> str:
     if not isinstance(key, str) or not key or len(key) > 200:
         raise InvalidRequest("key must be a non-empty string of at most 200 characters")
@@ -127,6 +147,25 @@ def validate_limit(payload: Any) -> Limit:
     return Limit(int(capacity), float(rate))
 
 
+def validate_window(payload: Any) -> Window:
+    """Window configuration: exactly `window_seconds` (1..3600) and `max_events`
+    (1..1000000), both required plain integers — booleans are rejected like every other
+    numeric field in the service, and any unknown field fails the whole body."""
+    if not isinstance(payload, dict):
+        raise InvalidRequest("body must be a JSON object")
+    extra = set(payload) - {"window_seconds", "max_events"}
+    if extra:
+        raise InvalidRequest(f"unknown fields: {sorted(extra)}")
+    window_seconds, max_events = payload.get("window_seconds"), payload.get("max_events")
+    if not isinstance(window_seconds, int) or isinstance(window_seconds, bool) \
+            or window_seconds < 1 or window_seconds > 3600:
+        raise InvalidRequest("window_seconds must be an integer between 1 and 3600")
+    if not isinstance(max_events, int) or isinstance(max_events, bool) \
+            or max_events < 1 or max_events > 1_000_000:
+        raise InvalidRequest("max_events must be an integer between 1 and 1000000")
+    return Window(window_seconds, max_events)
+
+
 class Limiter:
     """One token bucket per tenant key. `now` is a seconds callable, injected for tests.
 
@@ -152,6 +191,9 @@ class Limiter:
         # Entries are appended inside the lock at booking time, so seq is dense and gap-free even
         # under concurrent settling; the list is never trimmed (read-only views take a tail slice).
         self._ledgers: dict[str, list[LedgerEvent]] = {}
+        # Sliding-window limiters, independent of the buckets: window admissions never enter
+        # `used` or the ledger, and a key's window and bucket share nothing but the lock.
+        self._windows: dict[str, Window] = {}
         # Highest clock reading ever observed; the effective moment never moves below it.
         self._watermark = float("-inf")
 
@@ -352,6 +394,77 @@ class Limiter:
                 "events": [event.as_json() for event in events[-event_limit:]],
             }
 
+    def _prune_window(self, window: Window, now: float) -> None:
+        """Drop every admitted event at or past the expiry boundary. Caller holds the lock.
+
+        An event admitted at effective moment t leaves the window exactly when the current
+        effective moment reaches t + window_seconds, so events with t <= now - window_seconds
+        are gone: the boundary is inclusive and an event sitting precisely on it is evicted
+        first. A stalled or regressed clock holds `now` at the watermark, so nothing extra
+        expires and the regressed interval is never counted again on recovery.
+        """
+        cutoff = now - window.window_seconds
+        del window.events[:bisect_right(window.events, cutoff)]
+
+    def configure_window(self, key: Any, payload: Any) -> Window:
+        """Create or hot-update a window, keeping the already-admitted history.
+
+        The new configuration applies from this call on: events outside the new (possibly
+        shorter) window are evicted immediately, while a lowered max_events never revokes
+        past admissions — it only rejects future ones.
+        """
+        key = validate_key(key)
+        window = validate_window(payload)
+        with self._lock:
+            now = self._tick()
+            existing = self._windows.get(key)
+            if existing is not None:
+                window.events = existing.events
+            self._windows[key] = window
+            self._prune_window(window, now)
+        return window
+
+    def check_window(self, key: Any) -> dict[str, Any]:
+        """Admit one event into the key's window, counting only successful admissions.
+
+        A rejected check appends nothing, so a burst of 429s never changes the window's
+        occupancy; the Retry-After hint is the exact wait until the earliest live event
+        leaves the window, rendered by the shared ceiling-to-millisecond rule.
+        """
+        key = validate_key(key)
+        with self._lock:
+            now = self._tick()
+            window = self._windows.get(key)
+            if window is None:
+                raise LimitNotFound(f"no window configured for {key!r}")
+            self._prune_window(window, now)
+            if len(window.events) >= window.max_events:
+                retry_after = window.events[0] + window.window_seconds - now
+                raise OverQuota(f"window {key!r} is full: {len(window.events)} events "
+                                f"within {window.window_seconds}s", retry_after)
+            window.events.append(now)
+            used = len(window.events)
+            return {"allowed": True, "used": used, "remaining": window.max_events - used,
+                    "limit": window.max_events, "window_seconds": window.window_seconds}
+
+    def window_state(self, key: Any) -> dict[str, Any]:
+        """The same used/remaining snapshot check_window reports, without admitting anything.
+
+        Like every other public operation it samples the clock once inside the lock and prunes
+        against that single effective moment; a downgrade that left used above max_events
+        reports remaining as 0 (past admissions are kept, never revoked).
+        """
+        key = validate_key(key)
+        with self._lock:
+            now = self._tick()
+            window = self._windows.get(key)
+            if window is None:
+                raise LimitNotFound(f"no window configured for {key!r}")
+            self._prune_window(window, now)
+            used = len(window.events)
+            return {"window": window.as_json(), "used": used,
+                    "remaining": max(0, window.max_events - used)}
+
 
 def make_handler(limiter: Limiter) -> type[BaseHTTPRequestHandler]:
     class Handler(BaseHTTPRequestHandler):
@@ -454,6 +567,8 @@ def make_handler(limiter: Limiter) -> type[BaseHTTPRequestHandler]:
                     # validation precedes quota classification everywhere else.
                     event_limit = self._ledger_event_limit()
                     return self._send(200, limiter.ledger(parts[2], event_limit))
+                if len(parts) == 3 and parts[:2] == ["v1", "windows"]:
+                    return self._send(200, limiter.window_state(parts[2]))
                 return self._send(404, {"error": {"code": "not_found"}})
             except QuotaError as error:
                 return self._send(error.status, {"error": {"code": error.code, "message": str(error)}})
@@ -463,10 +578,13 @@ def make_handler(limiter: Limiter) -> type[BaseHTTPRequestHandler]:
         def do_PUT(self) -> None:  # noqa: N802
             try:
                 parts = self._route_segments()
-                if len(parts) != 3 or parts[:2] != ["v1", "limits"]:
+                if len(parts) != 3 or parts[0] != "v1" or parts[1] not in ("limits", "windows"):
                     return self._send(404, {"error": {"code": "not_found"}})
-                limit = limiter.configure(parts[2], self._read_json())
-                return self._send(200, {"key": parts[2], "limit": limit.as_json()})
+                if parts[1] == "limits":
+                    limit = limiter.configure(parts[2], self._read_json())
+                    return self._send(200, {"key": parts[2], "limit": limit.as_json()})
+                window = limiter.configure_window(parts[2], self._read_json())
+                return self._send(200, {"key": parts[2], "window": window.as_json()})
             except QuotaError as error:
                 return self._send(error.status, {"error": {"code": error.code, "message": str(error)}})
             except Exception:
@@ -494,6 +612,12 @@ def make_handler(limiter: Limiter) -> type[BaseHTTPRequestHandler]:
                     if not isinstance(body, dict) or body:
                         raise InvalidRequest('body must be an empty JSON object {}')
                     result = limiter.consume(parts[2])
+                    return self._send(200, result)
+                if len(parts) == 4 and parts[:2] == ["v1", "windows"] and parts[3] == "check":
+                    body = self._read_json()
+                    if not isinstance(body, dict) or body:
+                        raise InvalidRequest('body must be an empty JSON object {}')
+                    result = limiter.check_window(parts[2])
                     return self._send(200, result)
                 return self._send(404, {"error": {"code": "not_found"}})
             except OverQuota as error:

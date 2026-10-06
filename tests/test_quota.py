@@ -1663,5 +1663,281 @@ class RouteClassificationHttpTests(unittest.TestCase):
         self.assertEqual(self.request("GET", "/health")[0], 200)
 
 
+class WindowUnitTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.clock = Clock()
+        self.limiter = Limiter(self.clock)
+        self.limiter.configure_window("w", {"window_seconds": 10, "max_events": 3})
+
+    def test_admission_counts_and_response_shape(self) -> None:
+        first = self.limiter.check_window("w")
+        self.assertEqual(first, {"allowed": True, "used": 1, "remaining": 2,
+                                 "limit": 3, "window_seconds": 10})
+        second = self.limiter.check_window("w")
+        self.assertEqual((second["used"], second["remaining"]), (2, 1))
+        state = self.limiter.window_state("w")
+        self.assertEqual(state, {"window": {"window_seconds": 10, "max_events": 3},
+                                 "used": 2, "remaining": 1})
+
+    def test_full_window_rejects_and_earliest_expiry_frees_a_slot(self) -> None:
+        self.limiter.check_window("w")                           # admitted at t=1000
+        self.clock.t = 1001.0
+        self.limiter.check_window("w")
+        self.limiter.check_window("w")                           # full: 1 at 1000, 2 at 1001
+        with self.assertRaises(OverQuota) as raised:
+            self.limiter.check_window("w")
+        self.assertAlmostEqual(raised.exception.retry_after, 9.0, places=6)   # until 1010
+        self.clock.t = 1009.999
+        with self.assertRaises(OverQuota):
+            self.limiter.check_window("w")                       # all three still live
+        self.clock.t = 1010.0
+        result = self.limiter.check_window("w")                  # boundary evicts only the first
+        self.assertEqual((result["used"], result["remaining"]), (3, 0))
+        self.assertEqual(self.limiter.window_state("w")["used"], 3)
+
+    def test_boundary_event_is_evicted_exactly_at_expiry(self) -> None:
+        self.limiter.check_window("w")                           # t=1000, expires at 1010
+        self.clock.t = 1009.999999
+        self.assertEqual(self.limiter.window_state("w")["used"], 1)
+        self.clock.t = 1010.0                                    # inclusive boundary
+        self.assertEqual(self.limiter.window_state("w"),
+                         {"window": {"window_seconds": 10, "max_events": 3},
+                          "used": 0, "remaining": 3})
+
+    def test_rejected_checks_are_not_counted(self) -> None:
+        for _ in range(3):
+            self.limiter.check_window("w")
+        for _ in range(5):
+            with self.assertRaises(OverQuota):
+                self.limiter.check_window("w")
+        self.assertEqual(self.limiter.window_state("w")["used"], 3)
+
+    def test_stalled_and_regressed_clock_never_evicts(self) -> None:
+        for _ in range(3):
+            self.limiter.check_window("w")                       # t=1000
+        for _ in range(3):
+            self.assertEqual(self.limiter.window_state("w")["used"], 3)   # stalled
+        self.clock.t = 990.0                                     # regressed: stays at watermark
+        self.assertEqual(self.limiter.window_state("w")["used"], 3)
+        self.clock.t = 1010.0                                    # recovery: only 1000->1010 counts
+        self.assertEqual(self.limiter.window_state("w")["used"], 0)
+
+    def test_hot_update_keeps_history_and_shortening_evicts_immediately(self) -> None:
+        self.limiter.check_window("w")                           # t=1000
+        self.clock.t += 5
+        self.limiter.check_window("w")                           # t=1005
+        # Same window length: both events survive the update.
+        self.limiter.configure_window("w", {"window_seconds": 10, "max_events": 5})
+        self.assertEqual(self.limiter.window_state("w")["used"], 2)
+        # Shortening to 4s at t=1005 evicts the t=1000 event right in the PUT.
+        self.limiter.configure_window("w", {"window_seconds": 4, "max_events": 5})
+        state = self.limiter.window_state("w")
+        self.assertEqual((state["used"], state["remaining"]), (1, 4))
+
+    def test_lowering_max_events_keeps_history_and_rejects_new(self) -> None:
+        for _ in range(3):
+            self.limiter.check_window("w")
+        self.limiter.configure_window("w", {"window_seconds": 10, "max_events": 1})
+        state = self.limiter.window_state("w")
+        self.assertEqual((state["used"], state["remaining"]), (3, 0))   # nothing revoked
+        with self.assertRaises(OverQuota):
+            self.limiter.check_window("w")
+        self.clock.t += 10                                       # all three expire
+        result = self.limiter.check_window("w")                  # new limit now admits one
+        self.assertEqual((result["used"], result["remaining"], result["limit"]), (1, 0, 1))
+
+    def test_invalid_configurations_are_rejected_and_change_nothing(self) -> None:
+        for bad in [{"window_seconds": 0, "max_events": 1},
+                    {"window_seconds": 3601, "max_events": 1},
+                    {"window_seconds": 1.5, "max_events": 1},
+                    {"window_seconds": True, "max_events": 1},
+                    {"window_seconds": 10},
+                    {"window_seconds": 10, "max_events": 0},
+                    {"window_seconds": 10, "max_events": 1_000_001},
+                    {"window_seconds": 10, "max_events": False},
+                    {"window_seconds": 10, "max_events": 2.0},
+                    {"window_seconds": 10, "max_events": 1, "extra": 1},
+                    {}, "nope", [], None, 5]:
+            with self.assertRaises(InvalidRequest, msg=repr(bad)):
+                self.limiter.configure_window("w", bad)
+        self.assertEqual(self.limiter.window_state("w"),
+                         {"window": {"window_seconds": 10, "max_events": 3},
+                          "used": 0, "remaining": 3})
+        for bad_key in [1, True, None, "", "x" * 201, ["w"]]:
+            with self.assertRaises(InvalidRequest):
+                self.limiter.configure_window(bad_key, {"window_seconds": 1, "max_events": 1})
+
+    def test_unknown_window_is_not_found(self) -> None:
+        with self.assertRaises(LimitNotFound):
+            self.limiter.check_window("ghost")
+        with self.assertRaises(LimitNotFound):
+            self.limiter.window_state("ghost")
+
+    def test_windows_are_isolated_from_buckets_and_the_ledger(self) -> None:
+        self.limiter.configure("w", {"capacity": 2, "refill_per_second": 1.0})
+        for _ in range(3):
+            self.limiter.check_window("w")                       # window full
+        with self.assertRaises(OverQuota):
+            self.limiter.check_window("w")
+        state = self.limiter.state("w")                          # bucket untouched by admissions
+        self.assertEqual((state["remaining"], state["used"]), (2, 0))
+        self.assertEqual(self.limiter.ledger("w")["totals"],
+                         {"accepted_count": 0, "accepted_cost": 0})
+        self.assertTrue(self.limiter.check("w", 1)["allowed"])   # bucket still spends independently
+        self.assertEqual(self.limiter.window_state("w")["used"], 3)
+
+    def test_concurrent_checks_and_updates_never_exceed_the_limit(self) -> None:
+        limiter = Limiter(self.clock)                            # clock frozen for the whole test
+        limiter.configure_window("hot", {"window_seconds": 60, "max_events": 100})
+        outcomes: list[bool] = []
+        outcomes_lock = threading.Lock()
+
+        def attempt() -> None:
+            try:
+                limiter.check_window("hot")
+                ok = True
+            except OverQuota:
+                ok = False
+            with outcomes_lock:
+                outcomes.append(ok)
+
+        def reconfigure() -> None:
+            for _ in range(20):
+                limiter.configure_window("hot", {"window_seconds": 60, "max_events": 100})
+
+        threads = [threading.Thread(target=attempt) for _ in range(400)]
+        threads += [threading.Thread(target=reconfigure) for _ in range(4)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(sum(outcomes), 100)
+        self.assertEqual(limiter.window_state("hot")["used"], 100)
+
+
+class WindowHttpTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        import http.client
+
+        cls.http_client = http.client
+        from quota import serve
+
+        cls.clock = Clock()
+        cls.server = serve(port=0, now=cls.clock)
+        cls.port = cls.server.server_address[1]
+        threading.Thread(target=cls.server.serve_forever, daemon=True).start()
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.server.shutdown()
+
+    def request(self, method: str, path: str, body: dict | None = None) -> tuple[int, dict, dict]:
+        data = None if body is None else json.dumps(body).encode()
+        request = urllib.request.Request(f"http://127.0.0.1:{self.port}{path}", data=data, method=method,
+                                         headers={"Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(request, timeout=5) as response:
+                return response.status, json.loads(response.read() or b"{}"), dict(response.headers)
+        except urllib.error.HTTPError as error:
+            return error.code, json.loads(error.read() or b"{}"), dict(error.headers)
+
+    def raw_request(self, method: str, path: str, payload: bytes | None,
+                    content_length: str | object = "auto") -> tuple[int, dict]:
+        connection = self.http_client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        connection.putrequest(method, path)
+        if content_length != "omit":
+            connection.putheader("Content-Length",
+                                 str(len(payload)) if content_length == "auto" else content_length)
+        connection.endheaders(payload if payload is not None else b"")
+        response = connection.getresponse()
+        body = json.loads(response.read() or b"{}")
+        connection.close()
+        return response.status, body
+
+    def test_configure_check_and_snapshot_lifecycle(self) -> None:
+        status, body, _ = self.request("PUT", "/v1/windows/w-1",
+                                       {"window_seconds": 30, "max_events": 2})
+        self.assertEqual((status, body), (200, {"key": "w-1",
+                                                "window": {"window_seconds": 30, "max_events": 2}}))
+        status, body, _ = self.request("POST", "/v1/windows/w-1/check", {})
+        self.assertEqual((status, body), (200, {"allowed": True, "used": 1, "remaining": 1,
+                                                "limit": 2, "window_seconds": 30}))
+        status, body, _ = self.request("GET", "/v1/windows/w-1")
+        self.assertEqual((status, body), (200, {"window": {"window_seconds": 30, "max_events": 2},
+                                                "used": 1, "remaining": 1}))
+
+    def test_full_window_is_429_with_millisecond_retry_after(self) -> None:
+        clock = type(self).clock
+        clock.t = 20000.0
+        self.request("PUT", "/v1/windows/w-2", {"window_seconds": 10, "max_events": 1})
+        self.assertEqual(self.request("POST", "/v1/windows/w-2/check", {})[0], 200)
+        clock.t += 9.9999                                        # earliest event leaves in 0.0001s
+        status, body, headers = self.request("POST", "/v1/windows/w-2/check", {})
+        self.assertEqual((status, body["error"]["code"]), (429, "over_quota"))
+        self.assertEqual(headers["Retry-After"], "0.001")        # ceiling, three decimals
+        clock.t = 20010.0                                        # boundary: the event is gone
+        status, body, _ = self.request("POST", "/v1/windows/w-2/check", {})
+        self.assertEqual((status, body["used"]), (200, 1))
+
+    def test_unknown_window_and_invalid_key(self) -> None:
+        self.assertEqual(self.request("GET", "/v1/windows/absent")[0], 404)
+        status, body, _ = self.request("POST", "/v1/windows/absent/check", {})
+        self.assertEqual((status, body["error"]["code"]), (404, "not_found"))
+        long_key = "x" * 201
+        for method, path, body in [("PUT", f"/v1/windows/{long_key}",
+                                    {"window_seconds": 1, "max_events": 1}),
+                                   ("GET", f"/v1/windows/{long_key}", None),
+                                   ("POST", f"/v1/windows/{long_key}/check", {})]:
+            status, parsed, _ = self.request(method, path, body)
+            self.assertEqual((status, parsed["error"]["code"]), (400, "invalid_request"), path)
+
+    def test_invalid_bodies_are_400_and_change_nothing(self) -> None:
+        self.request("PUT", "/v1/windows/w-3", {"window_seconds": 10, "max_events": 2})
+        for payload in (b"", b"[]", b"null", b"5", b'"x"', b"not json",
+                        b'{"window_seconds": 10}', b'{"max_events": 2}',
+                        b'{"window_seconds": true, "max_events": 2}',
+                        b'{"window_seconds": 10, "max_events": 2, "x": 1}',
+                        b'{"window_seconds": 0, "max_events": 2}',
+                        b'{"window_seconds": 10, "max_events": 1000001}'):
+            status, parsed = self.raw_request("PUT", "/v1/windows/w-3", payload)
+            self.assertEqual((status, parsed["error"]["code"]), (400, "invalid_request"), payload)
+        _, state, _ = self.request("GET", "/v1/windows/w-3")
+        self.assertEqual(state, {"window": {"window_seconds": 10, "max_events": 2},
+                                 "used": 0, "remaining": 2})
+
+    def test_check_requires_an_empty_object_body(self) -> None:
+        self.request("PUT", "/v1/windows/w-4", {"window_seconds": 10, "max_events": 2})
+        for payload in (b"", b"[]", b"null", b'{"cost": 1}', b"not json"):
+            status, parsed = self.raw_request("POST", "/v1/windows/w-4/check", payload)
+            self.assertEqual((status, parsed["error"]["code"]), (400, "invalid_request"), payload)
+        _, state, _ = self.request("GET", "/v1/windows/w-4")
+        self.assertEqual(state["used"], 0)                       # no rejected attempt counted
+
+    def test_route_and_method_mismatch_is_404_before_body(self) -> None:
+        cases = [("GET", "/v1/windows"), ("GET", "/v1/windows/a/check"),
+                 ("PUT", "/v1/windows"), ("PUT", "/v1/windows/a/check"),
+                 ("POST", "/v1/windows"), ("POST", "/v1/windows/a"),
+                 ("POST", "/v1/windows/a/b"), ("DELETE", "/v1/windows/a"),
+                 ("PATCH", "/v1/windows/a"), ("PUT", "/v1/windows/a/"),
+                 ("POST", "/v1/windows/a/check/"), ("POST", "/v1//windows/a/check")]
+        for method, path in cases:
+            status, parsed = self.raw_request(method, path, b'{"x": 1}')
+            self.assertEqual((status, parsed["error"]["code"]), (404, "not_found"), (method, path))
+        self.assertEqual(self.request("GET", "/v1/windows/a")[0], 404)     # never configured
+
+    def test_window_activity_never_touches_bucket_state_or_ledger(self) -> None:
+        self.request("PUT", "/v1/limits/w-5", {"capacity": 5, "refill_per_second": 1})
+        self.request("PUT", "/v1/windows/w-5", {"window_seconds": 60, "max_events": 2})
+        self.request("POST", "/v1/windows/w-5/check", {})
+        self.request("POST", "/v1/windows/w-5/check", {})
+        _, state, _ = self.request("GET", "/v1/limits/w-5")
+        self.assertEqual((state["remaining"], state["used"]), (5, 0))
+        _, ledger, _ = self.request("GET", "/v1/ledgers/w-5")
+        self.assertEqual(ledger["totals"], {"accepted_count": 0, "accepted_cost": 0})
+        _, snapshot, _ = self.request("GET", "/v1/windows/w-5")
+        self.assertEqual((snapshot["used"], snapshot["remaining"]), (2, 0))
+
+
 if __name__ == "__main__":
     unittest.main()

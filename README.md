@@ -92,6 +92,34 @@ PYTHONPATH=src python3 -m unittest discover -s tests -v
 - 未配置的 key ⇒ `404 not_found`；`events` 不是 1..1000 内的整数字面量、参数重复或出现任何未知查询参数
   ⇒ `400 invalid_request`（查询校验先于 key 的 404）；路径段数不对或方法不匹配 ⇒ `404 not_found`。
 
+### `PUT /v1/windows/{key}`
+创建或热更新一个**精确滑动窗口**限流器（与同名令牌桶完全独立）。请求体只接受
+`{"window_seconds": <int 1..3600>, "max_events": <int 1..1000000>}`（两个字段都必填，布尔值不算整数）。
+- 成功：`200 {"key": ..., "window": {"window_seconds": <int>, "max_events": <int>}}`。
+- **热更新保留已准入历史**，新配置从本响应起生效：缩短 `window_seconds` 立即淘汰落在新区间之外的事件；
+  降低 `max_events` 不追溯撤销已准入请求，只拒绝后续请求（快照中 `remaining` 下限为 0）。
+- 未知字段、缺字段、非法值（含布尔值）、非法 key、非对象或畸形请求体 ⇒ `400 invalid_request`，且不改任何状态。
+
+### `POST /v1/windows/{key}/check`
+以**空 JSON 对象 `{}`** 请求一次准入；只统计窗口内已成功准入的请求，被拒绝的请求不计入。
+- 未达到 `max_events` 时原子计入：`200 {"allowed": true, "used": <int 含本次>, "remaining": <max_events-used>,
+  "limit": <max_events>, "window_seconds": <int>}`。
+- 窗口已满：**`429`** `{"error":{"code":"over_quota",...}}`，带 **`Retry-After`**（秒，浮点；最早有效事件离开窗口
+  所需的精确秒数，按毫秒向上取整并保留三位小数，与令牌桶 429 同一渲染口径）。
+- 事件在 `effective_at - window_seconds` 处到期（边界含等号：恰在边界上的旧事件先被淘汰）；有效时刻沿用
+  单调时钟高水位线口径，每个公开操作进锁后只采样一次——时钟停住时不淘汰事件，回拨视为停留在水位线，
+  恢复后回拨区间不重复计算。
+- 请求体非空对象、非对象或畸形 JSON ⇒ `400 invalid_request` 且不计入；未知窗口 ⇒ `404 not_found`；
+  路径或方法不匹配 ⇒ 先返回 `404 not_found`，不读请求体。
+
+### `GET /v1/windows/{key}`
+`200 {"window": {"window_seconds": <int>, "max_events": <int>}, "used": <int>, "remaining": <int>}`——
+与同一时刻 check 口径一致的快照（先按有效时刻淘汰到期事件）。未知窗口 ⇒ `404 not_found`。
+
+- 窗口与令牌桶的并发操作在同一把锁下串行：并发 check 与热更新不会超限也不会重复计数。
+- 窗口计数**不进入** `GET /v1/limits/{key}` 的 `used`，也不产生账本事件；窗口状态只存进程内存，
+  与同名令牌桶 key 相互隔离。
+
 ## 错误语义
 
 ```json
@@ -102,5 +130,5 @@ PYTHONPATH=src python3 -m unittest discover -s tests -v
 
 ## 未实现（后续任务候选，非固定题单）
 
-滑动窗口/漏桶、分层配额、跨实例一致、热点键、降级与熔断、配置热更新的原子切换、
+漏桶、分层配额、跨实例一致、热点键、降级与熔断、配置热更新的原子切换、
 可观测性与压测基线。
