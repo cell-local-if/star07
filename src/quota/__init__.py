@@ -17,6 +17,7 @@ from .app import (  # noqa: F401
     serve,
     validate_cost,
     validate_key,
+    validate_keys,
     validate_limit,
     validate_ttl,
     validate_window,
@@ -25,4 +26,4 @@ from .app import (  # noqa: F401
 __all__ = ["Bucket", "DEFAULT_TTL_SECONDS", "InvalidRequest", "LedgerEvent", "Limit",
            "LimitNotFound", "Limiter", "OverQuota", "QuotaError", "Reservation", "SlidingWindow",
            "WindowConfig", "make_handler", "serve", "validate_cost", "validate_key",
-           "validate_limit", "validate_ttl", "validate_window"]
+           "validate_keys", "validate_limit", "validate_ttl", "validate_window"]

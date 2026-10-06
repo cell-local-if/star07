@@ -38,6 +38,23 @@ PYTHONPATH=src python3 -m unittest discover -s tests -v
 - 超限：**`429`** `{"error":{"code":"over_quota",...}}`，并带 **`Retry-After`**（秒，浮点；按当前 `refill_per_second` 计算并向上取整到毫秒，至少足够补足本次 `cost`，与 `POST /v1/reservations` 同一口径）。
 - 未配置的 key ⇒ `404 not_found`；`cost` 非法（含布尔值）⇒ `400 invalid_request`。
 
+### `POST /v1/hierarchies/check`
+面向**组织到租户**的层级即时扣减：复用 `PUT /v1/limits/{key}` 配置的既有令牌桶，不另建配置协议。
+请求体：`{"keys": [<string>, ...], "cost": <int 1..1000000，缺省 1>}`。
+- `keys` 为 **2..20 个互不重复**的非空字符串（每层沿用同一 key 规则：非空 ≤200 字符），按输入顺序表示上级到末级。
+- 与现有额度操作**共用同一临界区、同一次时钟采样**（高水位线口径）：先按既有规则对每层结算到期预留并补充令牌，
+  再同时判断每层是否足以承担本次 `cost`。
+- 全部足够：一次性扣减所有层，返回 `200 {"allowed": true, "cost": <int>, "layers": [{"key", "remaining", "capacity"}, ...]}`，
+  `layers` 按 `keys` 输入顺序，`remaining` 为扣减后的向下取整值；每层账本追加一条
+  `source` 为 `"hierarchy_check"`、`reservation_id` 为 `null` 的事件（`effective_at` 等字段与即时消耗同口径），
+  各层 `used` 按 `cost` 增加。
+- 任一层不足：**整体拒绝**，各层不扣减、不落账（既有惰性过期结算除外），返回 **`429 over_quota`**；
+  `Retry-After` 取所有不足层各自 `deficit / refill_per_second` 的**最大值**，沿用毫秒向上取整、三位小数格式。
+- body 含未知或缺失字段、`keys`/`cost` 非法、层重复 ⇒ `400 invalid_request`；结构合法但含未配置层
+  ⇒ `404 not_found`，`message` 指明输入顺序中第一个未配置的 key。错误优先级与既有端点一致：
+  `invalid_request` 先于 `not_found` 先于 `over_quota`。
+- 并发下层级请求**只能全成或全败**：不出现部分扣减或部分落账；时钟停住与回拨仍遵循高水位线。
+
 ### `POST /v1/reservations`
 预留（占用但不记为已消耗）。请求体：`{"key": <string 非空 ≤200 字符>, "cost": <int 1..1000000，缺省 1>, "ttl_seconds": <int 1..86400，缺省 60>}`。
 - 成功：`200 {"reservation_id": <进程内唯一的不透明字符串>, "key": ..., "cost": <int>, "remaining": <int>, "capacity": <int>, "ttl_seconds": <int>}`。
@@ -82,9 +99,10 @@ PYTHONPATH=src python3 -m unittest discover -s tests -v
 - 查询参数（可选）：`events=<int 1..1000>`，按 `seq` 升序返回最近的若干条事件；缺省 `100`。
 - 成功：`200 {"key": ..., "totals": {"accepted_count": <int>, "accepted_cost": <int>}, "events": [...]}`。
   `totals.accepted_cost` 恒等于同一状态下 `GET /v1/limits/{key}` 的 `used`；`accepted_count` 为事件总数（不受 `events` 窗口影响）。
-- 每条事件固定为 `{"seq": <int 从 1 起每 key 连续递增>, "source": "check"|"reservation_consume", "reservation_id": <string|null>, "cost": <int>, "remaining": <int>, "capacity": <int>, "effective_at": <float>}`：
-  - 成功的 `check` 与成功的（首次）consume 各生成且只生成一条；`check` 事件的 `reservation_id` 为 `null`，
-    consume 事件使用原预留标识。重复 consume 幂等重放、不追加；令牌不足、回滚、过期结算与各类校验失败均不生成事件。
+- 每条事件固定为 `{"seq": <int 从 1 起每 key 连续递增>, "source": "check"|"reservation_consume"|"hierarchy_check", "reservation_id": <string|null>, "cost": <int>, "remaining": <int>, "capacity": <int>, "effective_at": <float>}`：
+  - 成功的 `check`、成功的（首次）consume 与层级扣减的每一层各生成且只生成一条；`check` 与 `hierarchy_check`
+    事件的 `reservation_id` 为 `null`，consume 事件使用原预留标识。重复 consume 幂等重放、不追加；令牌不足
+    （含层级整体拒绝）、回滚、过期结算与各类校验失败均不生成事件。
   - `cost` 为实际记账数；`remaining`/`capacity` 取记账完成临界区内的数值；`effective_at` 为产生该事件的公开操作
     在同一临界区内采样的有效时刻（高水位线口径）。
 - 账本读取**只加锁拷贝，不采样时钟、不补充、不到期结算、不落账**：时钟停住或回拨时不会借读取提前退款、补充或落账；
