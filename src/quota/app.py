@@ -58,6 +58,8 @@ class Reservation:
     created_at: float
     ttl_seconds: int
     rolled_back: bool = False
+    consumed: bool = False
+    consume_result: dict[str, Any] | None = None
 
     def expires_at(self) -> float:
         return self.created_at + self.ttl_seconds
@@ -143,10 +145,11 @@ class Limiter:
         bucket is credited. The bucket refills by elapsed time first, then the returned cost is capped
         at the key's current capacity. Boundary is inclusive (created_at + ttl <= now). Caller holds
         the lock; a no-op when the key has no due reservations (and never touches an unconfigured key).
+        Consumed reservations are never refunded: they stay in the registry as idempotency records.
         """
         now = self._now()
         due = [rid for rid, reservation in self._reservations.items()
-               if reservation.key == key and not reservation.rolled_back
+               if reservation.key == key and not reservation.rolled_back and not reservation.consumed
                and reservation.expires_at() <= now]
         if not due:
             return 0
@@ -205,7 +208,7 @@ class Limiter:
             # already been refunded, so it is unknown to this endpoint and returns 404.
             self._expire_due(key)
             reservation = self._reservations.get(reservation_id)
-            if reservation is None or reservation.rolled_back:
+            if reservation is None or reservation.rolled_back or reservation.consumed:
                 raise LimitNotFound(f"no rollbackable reservation {reservation_id!r}")
             reservation.rolled_back = True
             del self._reservations[reservation_id]
@@ -214,6 +217,37 @@ class Limiter:
             bucket.tokens = min(float(limit.capacity), bucket.tokens + reservation.cost)
             return {"reservation_id": reservation_id, "rolled_back": True,
                     "remaining": int(bucket.tokens), "capacity": limit.capacity}
+
+    def consume(self, reservation_id: str) -> dict[str, Any]:
+        """Confirm a live reservation as actual consumption, booking its cost into `used` exactly once.
+
+        Starts with the same lazy expiry settle as every other entry point: a target at or past its
+        expires_at has already been refunded and is unknown here, so consume reports 404 and books
+        nothing. The held cost is neither refunded nor deducted again — it was taken from the bucket
+        at reserve time — it is only recorded in the cost history. The reservation_id is an
+        idempotency key: replaying consume returns the first response verbatim and never books twice.
+        A consumed reservation can no longer be rolled back and is never refunded by later expiry.
+        """
+        with self._lock:
+            reservation = self._reservations.get(reservation_id)
+            if reservation is None:
+                raise LimitNotFound(f"no consumable reservation {reservation_id!r}")
+            if reservation.consumed:
+                return dict(reservation.consume_result)  # type: ignore[arg-type]
+            key = reservation.key
+            self._expire_due(key)
+            reservation = self._reservations.get(reservation_id)
+            if reservation is None or reservation.consumed:
+                raise LimitNotFound(f"no consumable reservation {reservation_id!r}")
+            limit = self._limits[key]
+            bucket = self._refill(key)
+            reservation.consumed = True
+            bucket.cost_history.append(reservation.cost)
+            result = {"reservation_id": reservation_id, "consumed": True,
+                      "remaining": int(bucket.tokens), "capacity": limit.capacity,
+                      "used": sum(bucket.cost_history)}
+            reservation.consume_result = result
+            return dict(result)
 
     def state(self, key: str) -> dict[str, Any]:
         with self._lock:
@@ -309,6 +343,11 @@ def make_handler(limiter: Limiter) -> type[BaseHTTPRequestHandler]:
                         return self._send(error.status, {"error": {"code": error.code, "message": str(error)}},
                                           {"Retry-After": f"{retry_after:.3f}"})
                     return self._send(200, result)
+                if len(parts) == 4 and parts[:2] == ["v1", "reservations"] and parts[3] == "consume":
+                    body = self._read_json()
+                    if not isinstance(body, dict) or body:
+                        raise InvalidRequest("body must be an empty JSON object {}")
+                    return self._send(200, limiter.consume(parts[2]))
                 return self._send(404, {"error": {"code": "not_found"}})
             except OverQuota as error:
                 return self._send(error.status, {"error": {"code": error.code, "message": str(error)}},
