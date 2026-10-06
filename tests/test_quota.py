@@ -777,5 +777,240 @@ class ConsumeHttpTests(unittest.TestCase):
         self.assertEqual((body["remaining"], body["capacity"], body["used"]), (3, 10, 4))
 
 
+class DriftClock:
+    """Clock whose readings jump forward by `step` on every read after the clock is (re)set.
+
+    Any operation that takes more than one reading per call observes a different moment for each
+    read; the limiter must act on exactly one effective moment per critical section.
+    """
+
+    def __init__(self, start: float = 100.0, step: float = 1000.0) -> None:
+        self.step = step
+        self.set(start)
+
+    def set(self, t: float) -> None:
+        self.t = t
+        self._reads = 0
+
+    def __call__(self) -> float:
+        self._reads += 1
+        return self.t + (self._reads - 1) * self.step
+
+
+class JitterClock:
+    """Clock that jitters backwards on every other read while its base only advances."""
+
+    def __init__(self, start: float = 0.0) -> None:
+        self.t = start
+        self._reads = 0
+
+    def __call__(self) -> float:
+        self._reads += 1
+        return self.t - 5.0 if self._reads % 2 == 0 else self.t
+
+
+class ClockRegressionUnitTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.clock = Clock()
+        self.limiter = Limiter(self.clock)
+
+    def test_regressed_reading_refills_nothing_and_recovery_counts_forward_time_once(self) -> None:
+        self.clock.t = 100.0
+        self.limiter.configure("tenant-a", {"capacity": 10, "refill_per_second": 1.0})
+        self.assertEqual(self.limiter.check("tenant-a", 10)["remaining"], 0)
+
+        self.clock.t = 90.0                                    # clock jumps backwards
+        self.assertEqual(self.limiter.state("tenant-a")["remaining"], 0)   # no phantom refill
+        self.assertEqual(self.limiter.state("tenant-a")["remaining"], 0)   # stable while regressed
+
+        self.clock.t = 101.0                                   # recovers just past the waterline
+        self.assertEqual(self.limiter.state("tenant-a")["remaining"], 1)   # only 1 real second
+        self.clock.t = 95.0                                    # regresses again below the waterline
+        self.assertEqual(self.limiter.state("tenant-a")["remaining"], 1)   # rollback interval not re-counted
+        self.clock.t = 101.0                                   # same effective moment again
+        self.assertEqual(self.limiter.state("tenant-a")["remaining"], 1)   # no double refill
+        self.clock.t = 102.0
+        self.assertEqual(self.limiter.state("tenant-a")["remaining"], 2)
+
+    def test_stalled_clock_refills_zero(self) -> None:
+        self.limiter.configure("tenant-a", {"capacity": 4, "refill_per_second": 1.0})
+        self.limiter.check("tenant-a", 4)
+        for _ in range(5):
+            self.assertEqual(self.limiter.state("tenant-a")["remaining"], 0)
+        with self.assertRaises(OverQuota):
+            self.limiter.check("tenant-a", 1)
+
+    def test_regression_neither_expires_nor_extends_a_reservation(self) -> None:
+        self.clock.t = 100.0
+        self.limiter.configure("tenant-a", {"capacity": 5, "refill_per_second": 0.0001})
+        reservation = self.limiter.reserve("tenant-a", 3, ttl_seconds=10)   # due at effective 110
+
+        self.clock.t = 95.0                                    # regressed: hold must survive
+        state = self.limiter.state("tenant-a")
+        self.assertEqual((state["remaining"], state["used"]), (2, 0))
+
+        self.clock.t = 109.0                                   # forward but still short of expiry
+        self.assertEqual(self.limiter.state("tenant-a")["remaining"], 2)
+
+        self.clock.t = 95.0                                    # regressed again: still held, not due
+        self.assertEqual(self.limiter.state("tenant-a")["remaining"], 2)
+
+        self.clock.t = 110.0                                   # effective expiry moment
+        state = self.limiter.state("tenant-a")
+        self.assertEqual((state["remaining"], state["used"]), (5, 0))      # refunded exactly once
+        self.assertEqual(self.limiter.state("tenant-a")["remaining"], 5)   # same moment: no second refund
+        with self.assertRaises(LimitNotFound):
+            self.limiter.rollback(reservation["reservation_id"])
+        with self.assertRaises(LimitNotFound):
+            self.limiter.consume(reservation["reservation_id"])
+        state = self.limiter.state("tenant-a")                 # failed settle attempts change nothing
+        self.assertEqual((state["remaining"], state["used"]), (5, 0))
+
+    def test_single_effective_moment_per_call_despite_intra_call_drift(self) -> None:
+        clock = DriftClock(start=100.0, step=1000.0)           # every extra read in a call jumps +1000s
+        limiter = Limiter(clock)
+        clock.set(100.0)
+        limiter.configure("tenant-a", {"capacity": 5, "refill_per_second": 0.0001})
+        clock.set(100.0)
+        reservation = limiter.reserve("tenant-a", 2, ttl_seconds=10)   # created at effective 100
+
+        clock.set(109.0)
+        self.assertEqual(limiter.state("tenant-a")["remaining"], 3)    # held: not yet due
+        clock.set(110.0)
+        self.assertEqual(limiter.state("tenant-a")["remaining"], 5)    # due at created_at + ttl
+        with self.assertRaises(LimitNotFound):
+            limiter.rollback(reservation["reservation_id"])
+
+    def test_intra_call_drift_cannot_skip_refill_forward(self) -> None:
+        clock = DriftClock(start=100.0, step=1000.0)
+        limiter = Limiter(clock)
+        clock.set(100.0)
+        limiter.configure("tenant-a", {"capacity": 10, "refill_per_second": 1.0})
+        clock.set(100.0)
+        self.assertTrue(limiter.check("tenant-a", 10)["allowed"])      # empty at effective 100
+        clock.set(101.0)
+        # A second in-call read would jump to 1101; the bucket watermark must stay at effective 101,
+        # so the next real second still refills exactly one token.
+        self.assertEqual(limiter.state("tenant-a")["remaining"], 1)
+        clock.set(102.0)
+        self.assertEqual(limiter.state("tenant-a")["remaining"], 2)
+
+    def test_regression_preserves_reconfigure_starting_point(self) -> None:
+        self.clock.t = 100.0
+        self.limiter.configure("tenant-a", {"capacity": 10, "refill_per_second": 1.0})
+        self.limiter.check("tenant-a", 7)                      # 3 tokens left at effective 100
+        self.clock.t = 90.0                                    # regressed
+        self.limiter.configure("tenant-a", {"capacity": 2, "refill_per_second": 1.0})
+        self.assertEqual(self.limiter.state("tenant-a")["remaining"], 2)   # min(3, 2), no refill
+        self.clock.t = 101.0
+        self.assertEqual(self.limiter.state("tenant-a")["remaining"], 2)   # 1s refill capped at 2
+
+    def test_consume_replay_is_stable_across_regression(self) -> None:
+        self.clock.t = 100.0
+        self.limiter.configure("tenant-a", {"capacity": 5, "refill_per_second": 1.0})
+        reservation = self.limiter.reserve("tenant-a", 2)
+        first = self.limiter.consume(reservation["reservation_id"])
+        self.clock.t = 50.0                                    # deep regression
+        self.assertEqual(self.limiter.consume(reservation["reservation_id"]), first)
+        state = self.limiter.state("tenant-a")
+        self.assertEqual((state["remaining"], state["used"]), (3, 2))
+
+    def test_concurrent_jittering_clock_never_oversells_or_loses_tokens(self) -> None:
+        clock = JitterClock(start=1000.0)
+        limiter = Limiter(clock)
+        limiter.configure("hot", {"capacity": 100, "refill_per_second": 0.0001})
+        outcomes: list[bool] = []
+        outcomes_lock = threading.Lock()
+
+        def attempt(check: bool) -> None:
+            try:
+                if check:
+                    limiter.check("hot", 1)
+                else:
+                    limiter.reserve("hot", 1)
+                ok = True
+            except OverQuota:
+                ok = False
+            with outcomes_lock:
+                outcomes.append(ok)
+
+        threads = [threading.Thread(target=attempt, args=(i % 2 == 0,)) for i in range(400)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(sum(outcomes), 100)                   # jitter never mints extra tokens
+        state = limiter.state("hot")
+        live = [r for r in limiter._reservations.values() if r.key == "hot"]
+        self.assertEqual(state["remaining"] + state["used"] + sum(r.cost for r in live), 100)
+
+
+class ClockRegressionHttpTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        from quota import serve
+
+        cls.clock = Clock()
+        cls.server = serve(port=0, now=cls.clock)
+        cls.port = cls.server.server_address[1]
+        threading.Thread(target=cls.server.serve_forever, daemon=True).start()
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.server.shutdown()
+
+    def request(self, method: str, path: str, body: dict | None = None) -> tuple[int, dict, dict]:
+        data = None if body is None else json.dumps(body).encode()
+        request = urllib.request.Request(f"http://127.0.0.1:{self.port}{path}", data=data, method=method,
+                                         headers={"Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(request, timeout=5) as response:
+                return response.status, json.loads(response.read() or b"{}"), dict(response.headers)
+        except urllib.error.HTTPError as error:
+            return error.code, json.loads(error.read() or b"{}"), dict(error.headers)
+
+    def test_regressed_clock_over_http_refills_nothing_and_recovers_once(self) -> None:
+        # unittest runs this after the holds_ test (alphabetical), whose waterline reached 210,
+        # so this scenario plays out on a later segment of the shared injected clock.
+        type(self).clock.t = 300.0
+        self.request("PUT", "/v1/limits/skew-1", {"capacity": 10, "refill_per_second": 1})
+        status, body, _ = self.request("POST", "/v1/check", {"key": "skew-1", "cost": 10})
+        self.assertEqual((status, body["remaining"]), (200, 0))
+
+        type(self).clock.t = 290.0                             # regressed
+        _, state, _ = self.request("GET", "/v1/limits/skew-1")
+        self.assertEqual((state["remaining"], state["used"]), (0, 10))
+
+        type(self).clock.t = 301.0                             # one real second past the waterline
+        _, state, _ = self.request("GET", "/v1/limits/skew-1")
+        self.assertEqual(state["remaining"], 1)
+        type(self).clock.t = 295.0                             # regressed again: no re-count
+        _, state, _ = self.request("GET", "/v1/limits/skew-1")
+        self.assertEqual(state["remaining"], 1)
+
+    def test_regressed_clock_over_http_holds_reservation_until_effective_expiry(self) -> None:
+        type(self).clock.t = 200.0
+        self.request("PUT", "/v1/limits/skew-2", {"capacity": 4, "refill_per_second": 0.0001})
+        _, body, _ = self.request("POST", "/v1/reservations",
+                                  {"key": "skew-2", "cost": 3, "ttl_seconds": 10})
+        rid = body["reservation_id"]
+
+        type(self).clock.t = 195.0                             # regressed: still held
+        _, state, _ = self.request("GET", "/v1/limits/skew-2")
+        self.assertEqual((state["remaining"], state["used"]), (1, 0))
+
+        type(self).clock.t = 210.0                             # effective expiry moment
+        _, state, _ = self.request("GET", "/v1/limits/skew-2")
+        self.assertEqual((state["remaining"], state["used"]), (4, 0))
+        _, state, _ = self.request("GET", "/v1/limits/skew-2")
+        self.assertEqual(state["remaining"], 4)                # refunded exactly once
+
+        self.assertEqual(self.request("DELETE", f"/v1/reservations/{rid}")[0], 404)
+        status, body, _ = self.request("POST", f"/v1/reservations/{rid}/consume", {})
+        self.assertEqual((status, body["error"]["code"]), (404, "not_found"))
+        _, state, _ = self.request("GET", "/v1/limits/skew-2")
+        self.assertEqual((state["remaining"], state["used"]), (4, 0))
+
+
 if __name__ == "__main__":
     unittest.main()

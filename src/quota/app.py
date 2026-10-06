@@ -99,7 +99,14 @@ def validate_limit(payload: Any) -> Limit:
 
 
 class Limiter:
-    """One token bucket per tenant key. `now` is a monotonic-seconds callable, injected for tests."""
+    """One token bucket per tenant key. `now` is a monotonic-seconds callable, injected for tests.
+
+    The raw clock is never trusted inside the critical section: every public operation takes exactly
+    one reading after acquiring the lock and clamps it to the highest reading observed so far (the
+    waterline). Refill, expiry settle, reservation creation and reconfigure all act on that single
+    effective moment, so a stalled or backwards clock adds nothing, and when the clock recovers the
+    regressed interval is never counted a second time.
+    """
 
     def __init__(self, now: Callable[[], float]) -> None:
         self._now = now
@@ -110,18 +117,29 @@ class Limiter:
         # Confirmed holds leave the active registry for good; the value is the exact first consume
         # response, replayed verbatim for idempotent retries (used is never booked a second time).
         self._consumed: dict[str, dict[str, Any]] = {}
+        # Highest clock reading ever observed; effective time never moves below this waterline.
+        self._waterline = float("-inf")
+
+    def _effective_now(self) -> float:
+        """The single effective moment for one critical section: the raw reading clamped to the
+        waterline, which is raised in place when the clock genuinely advances. Caller holds the lock."""
+        reading = float(self._now())
+        if reading > self._waterline:
+            self._waterline = reading
+        return self._waterline
 
     def configure(self, key: Any, payload: Any) -> Limit:
         key = validate_key(key)
         limit = validate_limit(payload)
         with self._lock:
+            now = self._effective_now()
             # Reconfiguration starts with the same lazy expiry settle every other operation does;
             # the release is credited against the bucket running under the old configuration.
-            self._expire_due(key)
+            self._expire_due(key, now)
             self._limits[key] = limit
             existing = self._buckets.get(key)
             self._buckets[key] = Bucket(limit.capacity if existing is None else min(existing.tokens, limit.capacity),
-                                        self._now(), existing.cost_history if existing else [])
+                                        now, existing.cost_history if existing else [])
         return limit
 
     def limit(self, key: str) -> Limit:
@@ -130,24 +148,27 @@ class Limiter:
                 raise LimitNotFound(f"no limit configured for {key!r}")
             return self._limits[key]
 
-    def _refill(self, key: str) -> Bucket:
+    def _refill(self, key: str, now: float) -> Bucket:
         limit = self._limits[key]
-        bucket = self._buckets.get(key) or Bucket(limit.capacity, self._now())
-        elapsed = max(0.0, self._now() - bucket.updated_at)
+        bucket = self._buckets.get(key) or Bucket(limit.capacity, now)
+        # `now` is the clamped effective moment and `updated_at` only ever stores effective moments,
+        # so elapsed is never negative: a stalled or regressed clock refills exactly zero, and the
+        # regressed interval is not re-counted when the clock later recovers past the waterline.
+        elapsed = max(0.0, now - bucket.updated_at)
         bucket.tokens = min(float(limit.capacity), bucket.tokens + elapsed * limit.refill_per_second)
-        bucket.updated_at = self._now()
+        bucket.updated_at = now
         self._buckets[key] = bucket
         return bucket
 
-    def _expire_due(self, key: str) -> int:
+    def _expire_due(self, key: str, now: float) -> int:
         """Lazy, deterministic expiry settle: release every reservation of `key` whose TTL has elapsed.
 
         Each reservation's cost is returned at most once: it is removed from the registry before the
         bucket is credited. The bucket refills by elapsed time first, then the returned cost is capped
-        at the key's current capacity. Boundary is inclusive (created_at + ttl <= now). Caller holds
-        the lock; a no-op when the key has no due reservations (and never touches an unconfigured key).
+        at the key's current capacity. Boundary is inclusive (created_at + ttl <= now) on the effective
+        moment, so a regressed clock can neither expire a hold early nor delay one already due. Caller
+        holds the lock; a no-op when the key has no due reservations (and never touches an unconfigured key).
         """
-        now = self._now()
         due = [rid for rid, reservation in self._reservations.items()
                if reservation.key == key and not reservation.rolled_back
                and reservation.expires_at() <= now]
@@ -156,16 +177,17 @@ class Limiter:
         returned = sum(self._reservations[rid].cost for rid in due)
         for rid in due:
             del self._reservations[rid]
-        bucket = self._refill(key)
+        bucket = self._refill(key, now)
         bucket.tokens = min(float(self._limits[key].capacity), bucket.tokens + returned)
         return returned
 
     def check(self, key: Any, cost: Any) -> dict[str, Any]:
         cost = validate_cost(cost)
         with self._lock:
+            now = self._effective_now()
             limit = self.limit(key)
-            self._expire_due(key)
-            bucket = self._refill(key)
+            self._expire_due(key, now)
+            bucket = self._refill(key, now)
             if bucket.tokens >= cost:
                 bucket.tokens -= cost
                 bucket.cost_history.append(cost)
@@ -184,15 +206,16 @@ class Limiter:
         cost = validate_cost(cost)
         ttl_seconds = validate_ttl(ttl_seconds)
         with self._lock:
+            now = self._effective_now()
             limit = self.limit(key)
-            self._expire_due(key)
-            bucket = self._refill(key)
+            self._expire_due(key, now)
+            bucket = self._refill(key, now)
             if bucket.tokens < cost:
                 deficit = cost - bucket.tokens
                 raise OverQuota(f"key {key!r} has {bucket.tokens:.3f} tokens, needs {cost}",
                                 deficit / limit.refill_per_second)
             bucket.tokens -= cost
-            reservation = Reservation(uuid.uuid4().hex, key, cost, self._now(), ttl_seconds)
+            reservation = Reservation(uuid.uuid4().hex, key, cost, now, ttl_seconds)
             self._reservations[reservation.reservation_id] = reservation
             return {"reservation_id": reservation.reservation_id, "key": key, "cost": cost,
                     "remaining": int(bucket.tokens), "capacity": limit.capacity,
@@ -200,20 +223,21 @@ class Limiter:
 
     def rollback(self, reservation_id: str) -> dict[str, Any]:
         with self._lock:
+            now = self._effective_now()
             reservation = self._reservations.get(reservation_id)
             if reservation is None:
                 raise LimitNotFound(f"no rollbackable reservation {reservation_id!r}")
             key = reservation.key
             # Rollback starts with the same lazy settle: a reservation whose TTL has elapsed has
             # already been refunded, so it is unknown to this endpoint and returns 404.
-            self._expire_due(key)
+            self._expire_due(key, now)
             reservation = self._reservations.get(reservation_id)
             if reservation is None or reservation.rolled_back:
                 raise LimitNotFound(f"no rollbackable reservation {reservation_id!r}")
             reservation.rolled_back = True
             del self._reservations[reservation_id]
             limit = self._limits[key]
-            bucket = self._refill(key)
+            bucket = self._refill(key, now)
             bucket.tokens = min(float(limit.capacity), bucket.tokens + reservation.cost)
             return {"reservation_id": reservation_id, "rolled_back": True,
                     "remaining": int(bucket.tokens), "capacity": limit.capacity}
@@ -227,6 +251,7 @@ class Limiter:
         for byte and never books used again.
         """
         with self._lock:
+            now = self._effective_now()
             snapshot = self._consumed.get(reservation_id)
             if snapshot is not None:
                 return dict(snapshot)
@@ -236,12 +261,12 @@ class Limiter:
             key = reservation.key
             # A reservation whose TTL has elapsed is refunded by the existing settle first; the target
             # is then unknown, consumes nothing and is never booked later.
-            self._expire_due(key)
+            self._expire_due(key, now)
             reservation = self._reservations.pop(reservation_id, None)
             if reservation is None:
                 raise LimitNotFound(f"no consumable reservation {reservation_id!r}")
             limit = self._limits[key]
-            bucket = self._refill(key)
+            bucket = self._refill(key, now)
             bucket.cost_history.append(reservation.cost)
             snapshot = {"reservation_id": reservation_id, "consumed": True,
                         "remaining": int(bucket.tokens), "capacity": limit.capacity,
@@ -251,9 +276,10 @@ class Limiter:
 
     def state(self, key: str) -> dict[str, Any]:
         with self._lock:
+            now = self._effective_now()
             limit = self.limit(key)
-            self._expire_due(key)
-            bucket = self._refill(key)
+            self._expire_due(key, now)
+            bucket = self._refill(key, now)
             return {"limit": limit.as_json(), "remaining": int(bucket.tokens), "used": sum(bucket.cost_history)}
 
 
