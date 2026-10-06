@@ -1439,5 +1439,229 @@ class LedgerHttpTests(unittest.TestCase):
                          ({"accepted_count": 0, "accepted_cost": 0}, []))
 
 
+class CheckKeyValidationUnitTests(unittest.TestCase):
+    """Limiter.check applies the same key rule as configure/reserve, before any state work."""
+
+    def setUp(self) -> None:
+        self.clock = Clock()
+        self.limiter = Limiter(self.clock)
+        self.limiter.configure("tenant-a", {"capacity": 5, "refill_per_second": 1.0})
+
+    def test_invalid_keys_are_invalid_request(self) -> None:
+        for bad_key in [1, 0, 1.5, True, False, None, "", "x" * 201, ["tenant-a"], {"k": 1}]:
+            with self.assertRaises(InvalidRequest, msg=repr(bad_key)):
+                self.limiter.check(bad_key, 1)
+
+    def test_boundary_length_keys_are_accepted(self) -> None:
+        long_key = "k" * 200
+        self.limiter.configure(long_key, {"capacity": 1, "refill_per_second": 1.0})
+        self.assertTrue(self.limiter.check(long_key, 1)["allowed"])
+        self.limiter.configure("q", {"capacity": 1, "refill_per_second": 1.0})
+        self.assertTrue(self.limiter.check("q", 1)["allowed"])
+
+    def test_key_and_cost_both_invalid_is_invalid_request(self) -> None:
+        for bad_key, bad_cost in [(None, 0), ("", "1"), (1, True), (["k"], 1.5), ("x" * 201, None)]:
+            with self.assertRaises(InvalidRequest):
+                self.limiter.check(bad_key, bad_cost)
+
+    def test_valid_but_unconfigured_key_is_not_found(self) -> None:
+        with self.assertRaises(LimitNotFound):
+            self.limiter.check("ghost", 1)
+
+    def test_rejected_checks_leave_quota_reservations_and_ledger_untouched(self) -> None:
+        limiter = Limiter(self.clock)
+        limiter.configure("frozen", {"capacity": 5, "refill_per_second": 0.0001})
+        reservation = limiter.reserve("frozen", 2, ttl_seconds=60)   # tokens 3
+        self.assertTrue(limiter.check("frozen", 1)["allowed"])       # tokens 2, used 1
+        before_ledger = limiter.ledger("frozen", 1000)
+        for bad_key in [1, True, None, "", "x" * 201, ["frozen"], {"key": 1}]:
+            with self.assertRaises(InvalidRequest):
+                limiter.check(bad_key, 1)
+        with self.assertRaises(InvalidRequest):
+            limiter.check("frozen", 0)                               # valid key, invalid cost
+        with self.assertRaises(InvalidRequest):
+            limiter.check(None, 0)                                   # both invalid
+        with self.assertRaises(LimitNotFound):
+            limiter.check("ghost", 1)                                # valid key, unknown
+        state = limiter.state("frozen")
+        self.assertEqual((state["remaining"], state["used"]), (2, 1))
+        self.assertEqual(limiter.ledger("frozen", 1000), before_ledger)
+        self.assertIn(reservation["reservation_id"], limiter._reservations)
+        # The hold is still live and rolls back normally.
+        self.assertTrue(limiter.rollback(reservation["reservation_id"])["rolled_back"])
+
+    def test_rejected_checks_ignore_clock_regression_and_stall(self) -> None:
+        clock = Clock()
+        clock.t = 100.0
+        limiter = Limiter(clock)
+        limiter.configure("k", {"capacity": 10, "refill_per_second": 1.0})
+        self.assertTrue(limiter.check("k", 10)["allowed"])           # empty at t=100
+        clock.t = 90.0                                               # regressed
+        for bad_key in ["", None, 1, "x" * 201]:
+            with self.assertRaises(InvalidRequest):
+                limiter.check(bad_key, 1)
+        self.assertEqual(limiter.state("k")["remaining"], 0)         # effectively still t=100
+        clock.t = 200.0
+        with self.assertRaises(InvalidRequest):
+            limiter.check(None, 1)                                   # must not sample t=200
+        clock.t = 105.0                                              # below the rejected reading
+        # A rejected check never ticks: only 100→105 refills, the t=200 reading is gone.
+        self.assertEqual(limiter.state("k")["remaining"], 5)
+
+
+class CheckHttpValidationTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        from quota import serve
+
+        cls.clock = Clock()
+        cls.server = serve(port=0, now=cls.clock)
+        cls.port = cls.server.server_address[1]
+        threading.Thread(target=cls.server.serve_forever, daemon=True).start()
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.server.shutdown()
+
+    def request(self, method: str, path: str, body: dict | None = None) -> tuple[int, dict, dict]:
+        data = None if body is None else json.dumps(body).encode()
+        request = urllib.request.Request(f"http://127.0.0.1:{self.port}{path}", data=data, method=method,
+                                         headers={"Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(request, timeout=5) as response:
+                return response.status, json.loads(response.read() or b"{}"), dict(response.headers)
+        except urllib.error.HTTPError as error:
+            return error.code, json.loads(error.read() or b"{}"), dict(error.headers)
+
+    def test_invalid_keys_are_400_and_change_nothing(self) -> None:
+        self.request("PUT", "/v1/limits/ck-1", {"capacity": 3, "refill_per_second": 1})
+        status, body, _ = self.request("POST", "/v1/check", {"key": "ck-1", "cost": 1})
+        self.assertEqual(status, 200)
+        self.assertEqual(body, {"allowed": True, "remaining": 2, "capacity": 3})
+        for bad_key in [1, True, None, "", "x" * 201, ["ck-1"], {"k": 1}, 1.5]:
+            status, body, _ = self.request("POST", "/v1/check", {"key": bad_key, "cost": 1})
+            self.assertEqual((status, body["error"]["code"]), (400, "invalid_request"), bad_key)
+        _, state, _ = self.request("GET", "/v1/limits/ck-1")
+        self.assertEqual((state["remaining"], state["used"]), (2, 1))
+        _, ledger, _ = self.request("GET", "/v1/ledgers/ck-1")
+        self.assertEqual(ledger["totals"], {"accepted_count": 1, "accepted_cost": 1})
+
+    def test_key_and_cost_both_invalid_is_400(self) -> None:
+        for body in [{"key": None, "cost": 0}, {"key": "", "cost": "x"}, {"key": 1, "cost": True}]:
+            status, parsed, _ = self.request("POST", "/v1/check", body)
+            self.assertEqual((status, parsed["error"]["code"]), (400, "invalid_request"), body)
+
+    def test_unknown_key_is_404_and_invalid_cost_is_400(self) -> None:
+        status, body, _ = self.request("POST", "/v1/check", {"key": "ghost", "cost": 1})
+        self.assertEqual((status, body["error"]["code"]), (404, "not_found"))
+        self.request("PUT", "/v1/limits/ck-2", {"capacity": 1, "refill_per_second": 1})
+        status, body, _ = self.request("POST", "/v1/check", {"key": "ck-2", "cost": 0})
+        self.assertEqual((status, body["error"]["code"]), (400, "invalid_request"))
+        _, state, _ = self.request("GET", "/v1/limits/ck-2")
+        self.assertEqual((state["remaining"], state["used"]), (1, 0))
+
+
+class RouteClassificationHttpTests(unittest.TestCase):
+    """Exact path segments and supported methods only; mismatches are 404 before any body work."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        import http.client
+
+        cls.http_client = http.client
+        from quota import serve
+
+        cls.clock = Clock()
+        cls.server = serve(port=0, now=cls.clock)
+        cls.port = cls.server.server_address[1]
+        threading.Thread(target=cls.server.serve_forever, daemon=True).start()
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.server.shutdown()
+
+    def request(self, method: str, path: str, body: dict | None = None) -> tuple[int, dict, dict]:
+        data = None if body is None else json.dumps(body).encode()
+        request = urllib.request.Request(f"http://127.0.0.1:{self.port}{path}", data=data, method=method,
+                                         headers={"Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(request, timeout=5) as response:
+                return response.status, json.loads(response.read() or b"{}"), dict(response.headers)
+        except urllib.error.HTTPError as error:
+            return error.code, json.loads(error.read() or b"{}"), dict(error.headers)
+
+    def raw_request(self, method: str, path: str, payload: bytes | None,
+                    content_length: str | object = "auto") -> tuple[int, dict]:
+        connection = self.http_client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        connection.putrequest(method, path)
+        if content_length != "omit":
+            connection.putheader("Content-Length",
+                                 str(len(payload)) if content_length == "auto" else content_length)
+        connection.endheaders(payload if payload is not None else b"")
+        response = connection.getresponse()
+        body = json.loads(response.read() or b"{}")
+        connection.close()
+        return response.status, body
+
+    def test_extra_slashes_never_reach_check_or_configure(self) -> None:
+        self.request("PUT", "/v1/limits/m-3", {"capacity": 2, "refill_per_second": 1})
+        for path in ["//v1/check", "/v1//check", "/v1/check/", "/v1/check/extra"]:
+            status, parsed = self.raw_request("POST", path, b'{"key": "m-3", "cost": 1}')
+            self.assertEqual((status, parsed["error"]["code"]), (404, "not_found"), path)
+        _, state, _ = self.request("GET", "/v1/limits/m-3")
+        self.assertEqual((state["remaining"], state["used"]), (2, 0))     # nothing deducted
+        for path in ["//v1/limits/m-4", "/v1//limits/m-4", "/v1/limits/m-4/", "/v1/limits/m-4/extra"]:
+            status, _ = self.raw_request("PUT", path, b'{"capacity": 5, "refill_per_second": 1}')
+            self.assertEqual(status, 404, path)
+        self.assertEqual(self.request("GET", "/v1/limits/m-4")[0], 404)     # never configured
+        for path in ["//health", "/health/", "/"]:
+            status, _ = self.raw_request("GET", path, None, content_length="omit")
+            self.assertEqual(status, 404, path)
+
+    def test_extra_slashes_never_reach_consume(self) -> None:
+        self.request("PUT", "/v1/limits/m-2", {"capacity": 2, "refill_per_second": 1})
+        _, body, _ = self.request("POST", "/v1/reservations", {"key": "m-2", "cost": 1})
+        rid = body["reservation_id"]
+        for path in [f"/v1/reservations/{rid}/consume/", f"//v1/reservations/{rid}/consume",
+                     f"/v1//reservations/{rid}/consume", f"/v1/reservations//{rid}/consume",
+                     f"/v1/reservations/{rid}//consume", f"/v1/reservations/{rid}/consume/extra"]:
+            status, parsed = self.raw_request("POST", path, b"{}")
+            self.assertEqual((status, parsed["error"]["code"]), (404, "not_found"), path)
+        # The hold was neither consumed nor refunded by the malformed attempts.
+        status, body, _ = self.request("POST", f"/v1/reservations/{rid}/consume", {})
+        self.assertEqual((status, body["consumed"], body["used"]), (200, True, 1))
+
+    def test_unsupported_methods_on_known_paths_are_404(self) -> None:
+        cases = [("GET", "/v1/check"), ("PUT", "/v1/check"), ("DELETE", "/v1/check"),
+                 ("PATCH", "/v1/check"), ("OPTIONS", "/v1/check"), ("HEAD", "/v1/check"),
+                 ("POST", "/health"), ("PUT", "/health"), ("DELETE", "/health"), ("PATCH", "/health"),
+                 ("POST", "/v1/limits/m-5"), ("DELETE", "/v1/limits/m-5"), ("PATCH", "/v1/limits/m-5"),
+                 ("GET", "/v1/reservations"), ("PUT", "/v1/reservations"), ("PATCH", "/v1/reservations"),
+                 ("POST", "/v1/ledgers/m-5"), ("PATCH", "/v1/ledgers/m-5"),
+                 ("GET", "/v1/reservations/m-5/consume"), ("DELETE", "/v1/reservations/m-5/consume")]
+        for method, path in cases:
+            payload = b'{"capacity": 1, "refill_per_second": 1}' if method in ("POST", "PUT", "PATCH") else None
+            status, parsed = self.raw_request(method, path, payload,
+                                              content_length="auto" if payload is not None else "omit")
+            if method == "HEAD":                                   # a HEAD response carries no body
+                self.assertEqual(status, 404, (method, path))
+                continue
+            self.assertEqual((status, parsed["error"]["code"]), (404, "not_found"), (method, path))
+        self.assertEqual(self.request("GET", "/v1/limits/m-5")[0], 404)     # never configured
+
+    def test_method_or_path_mismatch_beats_body_validation(self) -> None:
+        # Bad Content-Length and garbage bodies are never even inspected off-route.
+        status, parsed = self.raw_request("PATCH", "/v1/check", b"\xff\xfe", content_length="nine")
+        self.assertEqual((status, parsed["error"]["code"]), (404, "not_found"))
+        status, parsed = self.raw_request("POST", "/v1/check/", b"not json", content_length="nine")
+        self.assertEqual((status, parsed["error"]["code"]), (404, "not_found"))
+        status, parsed = self.raw_request("PUT", "/v1/limits", b"{")
+        self.assertEqual((status, parsed["error"]["code"]), (404, "not_found"))
+        status, parsed = self.raw_request("GET", "/v1/check", None, content_length="nine")
+        self.assertEqual((status, parsed["error"]["code"]), (404, "not_found"))
+        # The service itself is unaffected.
+        self.assertEqual(self.request("GET", "/health")[0], 200)
+
+
 if __name__ == "__main__":
     unittest.main()
