@@ -99,6 +99,16 @@ PYTHONPATH=src python3 -m unittest discover -s tests -v
   之前返回——不推进水位线、不结算到期预留、不补令牌、不扣减、不创建预留、不落账、不计入 reservation 指标、
   不改变 revision 或 ETag。`cost` 等于 `capacity` 仍按正常可用性口径判断（桶空时仍可能得到普通 429）。
 - 其余令牌不足（合法 `cost` 不超过 capacity 但桶内令牌不够）⇒ `429 over_quota` 并带 **`Retry-After`**（秒，浮点；按当前 `refill_per_second` 计算并向上取整到毫秒，至少足够补足本次 `cost`）。
+- **创建幂等（可选 `Idempotency-Key` 头）**：请求可带头 `Idempotency-Key: <1..128 个非空白 ASCII 字符>`，该头只属于本路由。
+  - 不带该头时行为与基线完全一致：key/cost/ttl 校验、令牌扣减、响应 JSON、`Retry-After`、metrics 与并发语义均不变。
+  - 携带该头且**首次创建成功（200）**时，服务把头值与完整请求参数（`key`、`cost`、`ttl_seconds`）及首次 200 响应（含 `reservation_id`、`remaining` 等全部字段）绑定。
+  - 之后**参数完全相同**的请求（头值相同）直接重放首次 200 响应：不再扣令牌、不再创建另一条预留、不增加 reservation 指标（既不计 `allowed` 也不计 `over_quota`）、不写账本、不采样时钟（不结算到期预留、不推进水位线）。
+  - 头值相同但 `key`、`cost` 或 `ttl_seconds` **任一不同** ⇒ **`409`** `{"error":{"code":"idempotency_conflict",...}}`，不带 `Retry-After`，且不改变令牌、预留、`used`、账本、决策计数与时钟水位线（冲突判断在锁内最前面完成，先于时钟采样）。
+  - **并发**到达的相同幂等请求收敛为一次创建：恰好一个请求实际占额并计一次 reservation `allowed`，其余请求得到同一 `reservation_id` 与逐字段相同的响应。
+  - 头存在但**为空、重复（多行同名头）、超过 128 字符、含空白字符或含非 ASCII 字符** ⇒ `400 invalid_request`；该校验在**读取请求体之前**完成，故不会读取或采纳请求体而造成部分状态变化，也不发送 `Retry-After`、不推进水位线。
+  - 普通 body 错误、未知 key、`cost` 超过 capacity、额度不足继续沿用既有 `400`/`404`/`429` 分类；**未创建成功的请求不绑定幂等键**，之后用同一幂等键的合法请求可正常首次创建。
+  - 绑定只属于单键创建：不改变 `reservation_id`、rollback、consume 重放与到期结算。预留生命周期结束（consume、rollback、自动过期）后绑定仍保留：相同的创建重试仍重放第一次的 200 创建响应、不能重新占额；参数不同仍返回 `idempotency_conflict`。
+  - 层级预留、check、ledger、ETag/If-Match、窗口、漏桶与既有错误优先级不受影响：幂等键不写账本、不新增 metrics 分类（metrics 形状保持五类不变），其他路由携带该头一律忽略。绑定只存在进程内存，重启清空，不承诺跨实例共享。
 
 ### `DELETE /v1/reservations/{reservation_id}`
 对**尚未过期且未回滚**的预留执行**一次**撤销：把预留扣掉的 `cost` 放回该 key 当前桶，并按当前 `capacity` 封顶（返还前也先按时间补充）。
@@ -282,12 +292,13 @@ PYTHONPATH=src python3 -m unittest discover -s tests -v
 ## 错误语义
 
 ```json
-{"error": {"code": "invalid_request|not_found|over_quota|revision_conflict|internal_error", "message": "<可读说明>"}}
+{"error": {"code": "invalid_request|not_found|over_quota|revision_conflict|idempotency_conflict|internal_error", "message": "<可读说明>"}}
 ```
 
 优先级：`Content-Length` 校验先于读体；路由不匹配先于体校验；`invalid_request` 先于 `not_found`/`over_quota`；
-`If-Match`/请求体的 `invalid_request` 在锁前返回，先于 key 的 `not_found`；合法 `If-Match` 对未配置 key 为
+`If-Match`/请求体/`Idempotency-Key` 头的 `invalid_request` 在锁前（`Idempotency-Key` 还在先于读体处）返回，先于 key 的 `not_found`；合法 `If-Match` 对未配置 key 为
 `404 not_found`；已配置 key 上版本不符为 `409 revision_conflict`（二者均在锁内、不改变任何状态）。
+`POST /v1/reservations` 携带已绑定的 `Idempotency-Key` 时，参数不一致为 `409 idempotency_conflict`，该判断在锁内、采样时钟之前，不改变任何状态。
 
 ## 乐观并发控制与兼容性
 
@@ -298,8 +309,10 @@ PYTHONPATH=src python3 -m unittest discover -s tests -v
 - revision 判断与更新在**同一把锁**内完成；PUT 的 ETag 命名本次安装的 revision，GET 的 ETag 与同一快照的
   状态在同一临界区取出。并发的两个同版本条件 PUT 中恰好一个成功（200，revision+1），另一个 409；后续若用
   新 ETag 重试即可成功。
-- 除新增 ETag 响应头与可选 `If-Match` 及其 `409` 外，不带 If-Match 的 PUT、GET、check、hierarchies、
+- 除新增 ETag 响应头与可选 `If-Match` 及其 `409`、`POST /v1/reservations` 可选 `Idempotency-Key` 及其
+  `409 idempotency_conflict` 外，不带这些头的 PUT、GET、check、hierarchies、
   reservations、ledgers、windows、leaky-buckets、metrics 的 JSON 形状、状态推进、错误分类与并发保证均不变。
+  `Idempotency-Key` 不写账本、不新增 metrics 分类，绑定只存进程内存（重启清空、不跨实例），且不作用于层级预留等其他路由。
 
 ## 未实现（后续任务候选，非固定题单）
 

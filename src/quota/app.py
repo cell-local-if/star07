@@ -32,6 +32,12 @@ class RevisionConflict(QuotaError):
     code, status = "revision_conflict", 409
 
 
+class IdempotencyConflict(QuotaError):
+    """A stored Idempotency-Key was replayed with request params other than the first creation's."""
+
+    code, status = "idempotency_conflict", 409
+
+
 class OverQuota(QuotaError):
     code, status = "over_quota", 429
 
@@ -149,6 +155,23 @@ class LeakyBucketConfig:
 
     def as_json(self) -> dict[str, Any]:
         return {"capacity": self.capacity, "leak_per_second": self.leak_per_second}
+
+
+@dataclass(frozen=True)
+class IdempotentReservation:
+    """One Idempotency-Key binding for POST /v1/reservations: the exact first-request params
+    and the verbatim first 200 response.
+
+    The binding belongs to creation only and lives in its own registry: it outlives the
+    reservation it created (expiry, rollback and consume leave it untouched), is never booked
+    to a ledger, counted in metrics or visible on any other route, and exists only in process
+    memory. Nothing binds the key unless the first creation fully succeeded.
+    """
+
+    key: str
+    cost: int
+    ttl_seconds: int
+    response: dict[str, Any]
 
 
 @dataclass
@@ -306,6 +329,28 @@ def etag_header(revision: int) -> str:
     return f'"{revision}"'
 
 
+IDEMPOTENCY_KEY_MAX_LENGTH = 128
+
+
+def validate_idempotency_key(value: Any) -> str:
+    """The sole accepted shape of POST /v1/reservations' optional Idempotency-Key header.
+
+    A present header must be exactly one value of 1..128 non-whitespace ASCII characters; an
+    empty value, a repeated header line (handled by the caller), a whitespace character or any
+    non-ASCII byte is invalid_request. Like If-Match and body validation this runs before the
+    lock (and, at the HTTP layer, before the body is read), so a malformed key can never deduct
+    tokens, create a reservation, advance the clock watermark or bind anything.
+    """
+    if not isinstance(value, str) or not 1 <= len(value) <= IDEMPOTENCY_KEY_MAX_LENGTH:
+        raise InvalidRequest(
+            "Idempotency-Key must be 1 to 128 non-whitespace ASCII characters")
+    for char in value:
+        if ord(char) > 127 or char.isspace():
+            raise InvalidRequest(
+                "Idempotency-Key must be 1 to 128 non-whitespace ASCII characters")
+    return value
+
+
 class Limiter:
     """One token bucket per tenant key. `now` is a seconds callable, injected for tests.
 
@@ -328,6 +373,13 @@ class Limiter:
         # does and is the only state the ETag/If-Match optimistic-concurrency protocol observes.
         self._revisions: dict[str, int] = {}
         self._reservations: dict[str, Reservation] = {}
+        # Idempotency-Key bindings for single-key reservation creation only: header value ->
+        # the exact first-request params and verbatim first 200 response. A binding is written
+        # only by a fully successful creation and is never removed by rollback, consume or
+        # expiry: a late retry still replays the original creation and can never hold tokens a
+        # second time. Process-local only, like everything else here — a restart forgets all
+        # keys, and nothing is shared across instances.
+        self._idempotent_reservations: dict[str, IdempotentReservation] = {}
         # Confirmed holds leave the active registry for good; the value is the exact first consume
         # response, replayed verbatim for idempotent retries (used is never booked a second time).
         self._consumed: dict[str, dict[str, Any]] = {}
@@ -659,16 +711,40 @@ class Limiter:
             return {"reservation_id": reservation.reservation_id, "keys": list(keys), "cost": cost,
                     "ttl_seconds": ttl_seconds, "layers": layers}
 
-    def reserve(self, key: Any, cost: Any, ttl_seconds: Any = DEFAULT_TTL_SECONDS) -> dict[str, Any]:
+    def reserve(self, key: Any, cost: Any, ttl_seconds: Any = DEFAULT_TTL_SECONDS,
+                idempotency_key: Any = None) -> dict[str, Any]:
         """Atomically hold `cost` tokens, exactly as check() judges them, without booking them as used.
 
         The hold lapses `ttl_seconds` of monotonic time after creation; reconfiguring the key never
         extends it. Expired holds are settled lazily at the start of this call (see _expire_due).
+
+        A non-None `idempotency_key` turns this call into a creation-idempotent one: the key is
+        validated first (mirroring the HTTP rule that the header is rejected before the body is
+        read), and inside the one critical section the lookup runs FIRST — before the clock is
+        sampled, before anything settles, refills or deducts. A stored binding whose params
+        match replays the exact first 200 response (no second hold, no decision count); a stored
+        binding whose key/cost/ttl differs is 409 idempotency_conflict and changes nothing (not
+        even the watermark). Only a fully successful creation binds the key: a 400/404/429
+        leaves the key free so a later legal retry is a genuine first creation.
         """
+        if idempotency_key is not None:
+            idempotency_key = validate_idempotency_key(idempotency_key)
         key = validate_key(key)
         cost = validate_cost(cost)
         ttl_seconds = validate_ttl(ttl_seconds)
         with self._lock:
+            if idempotency_key is not None:
+                binding = self._idempotent_reservations.get(idempotency_key)
+                if binding is not None:
+                    # Same header value: the whole request fingerprint must match. This branch —
+                    # replay or conflict — never samples the clock, so it can neither settle a
+                    # due hold nor advance the watermark; it also deducts nothing and counts no
+                    # decision. The binding outlives its reservation, so a retry after consume,
+                    # rollback or expiry still answers with the frozen first creation.
+                    if (binding.key, binding.cost, binding.ttl_seconds) != (key, cost, ttl_seconds):
+                        raise IdempotencyConflict(
+                            "Idempotency-Key was already used with different request parameters")
+                    return dict(binding.response)
             # Same unsatisfiable-cost rule as check(): a legal cost above the key's CURRENT
             # capacity can never be held, however long the caller waits, so it is 400
             # invalid_request instead of a 429 hinting a finite wait, and no Retry-After is
@@ -695,9 +771,15 @@ class Limiter:
             reservation = Reservation(uuid.uuid4().hex, key, cost, now, ttl_seconds)
             self._reservations[reservation.reservation_id] = reservation
             self._record_decision("reservation", "allowed")
-            return {"reservation_id": reservation.reservation_id, "key": key, "cost": cost,
-                    "remaining": int(bucket.tokens), "capacity": limit.capacity,
-                    "ttl_seconds": ttl_seconds}
+            result = {"reservation_id": reservation.reservation_id, "key": key, "cost": cost,
+                      "remaining": int(bucket.tokens), "capacity": limit.capacity,
+                      "ttl_seconds": ttl_seconds}
+            if idempotency_key is not None:
+                # Bind only on a fully successful creation: every rejection above skipped this
+                # line, so the same header value can still drive a later legal first creation.
+                self._idempotent_reservations[idempotency_key] = IdempotentReservation(
+                    key, cost, ttl_seconds, dict(result))
+            return result
 
     def rollback(self, reservation_id: str) -> dict[str, Any]:
         with self._lock:
@@ -1202,12 +1284,26 @@ def make_handler(limiter: Limiter) -> type[BaseHTTPRequestHandler]:
                     result = limiter.hierarchy_consume(parts[3])
                     return self._send(200, result)
                 if parts == ["v1", "reservations"]:
+                    # The creation Idempotency-Key belongs to this one route and is validated
+                    # before the body is read (the same place If-Match holds on PUT): an empty,
+                    # repeated, over-long, whitespace-bearing or non-ASCII value is 400
+                    # invalid_request without adopting any body state, deducting any token or
+                    # sending Retry-After. A missing header keeps the baseline flow byte for byte.
+                    idempotency_values = self.headers.get_all("Idempotency-Key")
+                    if idempotency_values is not None:
+                        if len(idempotency_values) != 1:
+                            raise InvalidRequest(
+                                "Idempotency-Key must be 1 to 128 non-whitespace ASCII characters")
+                        idempotency_key: str | None = validate_idempotency_key(idempotency_values[0])
+                    else:
+                        idempotency_key = None
                     body = self._read_json()
                     if not isinstance(body, dict) or set(body) - {"key", "cost", "ttl_seconds"}:
                         raise InvalidRequest(
                             'body must be {"key": <string>, "cost": <integer>, "ttl_seconds": <integer 1..86400>}')
                     ttl = body.get("ttl_seconds", DEFAULT_TTL_SECONDS)
-                    result = limiter.reserve(body.get("key"), body.get("cost", 1), ttl)
+                    result = limiter.reserve(body.get("key"), body.get("cost", 1), ttl,
+                                             idempotency_key)
                     return self._send(200, result)
                 if len(parts) == 4 and parts[:2] == ["v1", "reservations"] and parts[3] == "consume":
                     body = self._read_json()
