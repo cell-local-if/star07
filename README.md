@@ -213,6 +213,50 @@ PYTHONPATH=src python3 -m unittest discover -s tests -v
 - 窗口准入**不进入** `GET /v1/limits/{key}` 的 `used`，也不写入 `/v1/ledgers/{key}` 账本；令牌桶的
   check、配置、预留、consume、rollback、状态与账本的公开行为完全不变。
 
+### `PUT /v1/leaky-buckets/{key}`
+与令牌桶、窗口**彼此独立**的漏桶：水随时间以固定速率漏出，注入的请求抬高水位，水位加本次 cost
+不超过 `capacity` 才允许。请求体只接受
+`{"capacity": <int 1..1000000>, "leak_per_second": <number > 0 且 ≤ 1000000>}`
+（`capacity` 为非布尔整数、不允许缺省/浮点/布尔；`leak_per_second` 为非布尔数字、不允许缺省/布尔/
+非正数/超过 1000000；不允许未知字段）。
+- 成功：`200 {"key": ..., "level": <number 三位小数>, "capacity": <int>, "leak_per_second": <number>}`；
+  **无 ETag/If-Match/revision**。
+- **首次创建**：`level` 为 **0**。
+- **再次 PUT（热更新）**：在同一临界区内先按**旧** `leak_per_second` 漏出上一有效时刻到本次时刻之间的
+  水量并以 **0 为下限**，再装入新配置，并以**新 `capacity`** 对存活水量封顶（`min(漏出后水位, 新 capacity)`）；
+  新速率**不追溯**重配前的等待，容量缩小把超出部分立即截掉。
+- 非法 JSON、字段、key（同一 key 规则）或携带任何查询参数 ⇒ `400 invalid_request`，且**不创建桶、
+  不推进时钟水位线**（校验在锁前完成）。
+
+### `POST /v1/leaky-buckets/{key}/check`
+请求体必须是只含可选 `cost` 的 JSON 对象：`{}`（`cost` 缺省为 1）或 `{"cost": <int 1..1000000>}`。
+`cost` 规则与 `POST /v1/check` 相同（非布尔整数，缺省 1）。
+- 进入锁后**只采样一次时钟**，先按**当前** `leak_per_second` 漏出（以 0 为下限），再判断。
+- 允许（`level + cost <= capacity`，边界取等号）：计入并 `200 {"allowed": true, "cost": <int>,
+  "level": <number>, "capacity": <int>}`；`level` 为**计入后**占用量，保留**三位小数**。
+- 放不下：**不计** `cost`（水位不变），返回 **`429`** `{"error":{"code":"over_quota",...}}` 并带
+  **`Retry-After`**——补足 `level + cost - capacity` 缺口所需秒数（缺口除以当前 `leak_per_second`），
+  与其他 429 同一口径：按毫秒**向上取整**、保留三位小数，亚毫秒至少 `0.001`，永不为 `0.000`。
+- 非对象、含未知字段、`cost` 非法（含布尔）、畸形 JSON、缺 `Content-Length`，或携带任何查询参数
+  ⇒ `400 invalid_request`，且不抬高水位、不推进时钟水位线；未知桶 ⇒ `404 not_found`；路径段数不对、
+  末段不是 `check` 或方法不匹配 ⇒ **先**返回 `404 not_found` 且不读请求体。
+
+### `GET /v1/leaky-buckets/{key}`
+返回 check 同一有效时刻下的同一口径：先按当前速率漏出，再返回
+`200 {"key": ..., "level": <number 三位小数>, "capacity": <int>, "leak_per_second": <number>}`，
+恰好这四个字段（无 ETag）。未知桶 ⇒ `404 not_found`；携带任何查询参数 ⇒ `400 invalid_request`。
+
+#### 漏桶的时间语义（确定性）
+- 有效时刻沿用同一把锁、同一单调时钟**高水位线**与同一次 `_tick`：时钟停住时漏出量为 0；读数回拨视为
+  停留在水位线、不多漏；时钟恢复后回拨区间不被重复计入（`updated_at` 在每次有效时刻落戳）。
+- 并发 check 与热更新在同一把锁下串行：水位恒不超过当前 `capacity`，被拒请求不增加水位。
+
+#### 漏桶与其他子系统的隔离
+- 漏桶只存进程内存并在**独立命名空间**：同名的令牌桶、窗口与漏桶互不创建、互不计账。
+- 漏桶**不写** `/v1/ledgers/{key}` 账本、**没有** revision/ETag，也**不加入** `GET /v1/metrics` 的五类
+  决策计数（metrics 形状保持五类不变）；令牌桶、窗口、预留、层级、账本、revision 与既有接口的 JSON、
+  Retry-After、计数和时钟行为完全不变。
+
 ## 错误语义
 
 ```json
@@ -227,15 +271,15 @@ PYTHONPATH=src python3 -m unittest discover -s tests -v
 
 - revision 计数的是**成功配置写入**：首次创建为 1，之后每次成功 PUT（含配置完全相同的 PUT）+1；
   `400`/`404`/`429`/`409` 都不推进 revision，也不改变 ETag。
-- ETag 仅与单键限额配置关联：ledgers、windows、metrics、check、reservations、hierarchies 响应均不带 ETag；
-  同名窗口与令牌桶继续隔离，窗口 PUT/GET 不影响同名限额的 revision。
+- ETag 仅与单键限额配置关联：ledgers、windows、leaky-buckets、metrics、check、reservations、hierarchies 响应均不带 ETag；
+  同名窗口、漏桶与令牌桶继续隔离，窗口/漏桶 PUT/GET 不影响同名限额的 revision。
 - revision 判断与更新在**同一把锁**内完成；PUT 的 ETag 命名本次安装的 revision，GET 的 ETag 与同一快照的
   状态在同一临界区取出。并发的两个同版本条件 PUT 中恰好一个成功（200，revision+1），另一个 409；后续若用
   新 ETag 重试即可成功。
 - 除新增 ETag 响应头与可选 `If-Match` 及其 `409` 外，不带 If-Match 的 PUT、GET、check、hierarchies、
-  reservations、ledgers、windows、metrics 的 JSON 形状、状态推进、错误分类与并发保证均不变。
+  reservations、ledgers、windows、leaky-buckets、metrics 的 JSON 形状、状态推进、错误分类与并发保证均不变。
 
 ## 未实现（后续任务候选，非固定题单）
 
-漏桶、跨实例一致、热点键、降级与熔断、
+跨实例一致、热点键、降级与熔断、
 可观测性与压测基线。
