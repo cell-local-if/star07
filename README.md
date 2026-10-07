@@ -34,6 +34,17 @@ PYTHONPATH=src python3 -m unittest discover -s tests -v
   容量扩大不会把桶补满，新速率也不追溯作用于重配前的等待。重配开始时已到期的预留在同一临界区内按
   "先旧速率补充、再返还各自 cost、最后以新 capacity 封顶"的顺序结算；未到期预留继续占用。
 - 未知字段/非法值 ⇒ `400 invalid_request`。
+- **乐观并发（revision / ETag / If-Match）**：每个 key 的配置带一个 revision——首次成功创建为 1，
+  之后每次成功 PUT 递增 1（即使新旧配置完全相同也递增）。成功的 PUT 与 `GET /v1/limits/{key}` 响应都带
+  `ETag: "<revision>"`（带双引号的十进制字符串，如 `ETag: "3"`），响应 JSON 字段与取值口径不变。
+  - 请求可携带 `If-Match: "<revision>"`：只能是**一个带双引号、不含符号和空白的十进制正整数**；
+    与该 key 当前 revision 相同才允许更新，不同 ⇒ **`409`** `{"error":{"code":"revision_conflict","message":"If-Match revision does not match current configuration"}}`；
+    key 尚未配置 ⇒ `404 not_found`；格式非法 ⇒ `400 invalid_request`（与请求体校验同在**锁前**完成）。
+    缺少 `If-Match` 时按基线语义无条件更新。
+  - revision 判断与配置更新在**同一把锁**内完成；`409`/`404`/`400` 不产生任何部分状态变化——
+    不改限额、令牌、`used`、预留、账本、决策计数，也不推进时钟水位线。
+  - ETag 只反映配置 revision，**不代表**令牌、`used`、账本或窗口版本；同名滑动窗口与令牌桶继续隔离，
+    窗口路由不带 ETag 也不消费 revision。
 
 ### `POST /v1/check`
 请求体：`{"key": <string>, "cost": <int 1..1000000，缺省 1>}`
@@ -128,6 +139,7 @@ PYTHONPATH=src python3 -m unittest discover -s tests -v
 
 ### `GET /v1/limits/{key}`
 `200 {"limit": {...}, "remaining": <int>, "used": <int>}`（读取也会先按时间补充，体现当前余量；未确认的预留不计入 `used`）。
+响应带 `ETag: "<revision>"`，与同一快照的配置 revision 一致（同一临界区内读取）；读取本身不推进 revision。
 
 ### `GET /v1/ledgers/{key}`
 **只读配额账本**，供计费对账：给出形成了实际消耗的每一笔事件，以及与 `GET /v1/limits/{key}` 的 `used` 完全一致的合计。
@@ -202,10 +214,10 @@ PYTHONPATH=src python3 -m unittest discover -s tests -v
 ## 错误语义
 
 ```json
-{"error": {"code": "invalid_request|not_found|over_quota|internal_error", "message": "<可读说明>"}}
+{"error": {"code": "invalid_request|not_found|revision_conflict|over_quota|internal_error", "message": "<可读说明>"}}
 ```
 
-优先级：`Content-Length` 校验先于读体；路由不匹配先于体校验；`invalid_request` 先于 `not_found`/`over_quota`。
+优先级：`Content-Length` 校验先于读体；路由不匹配先于体校验；`invalid_request` 先于 `not_found`/`revision_conflict`/`over_quota`。
 
 ## 未实现（后续任务候选，非固定题单）
 

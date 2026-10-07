@@ -26,6 +26,10 @@ class LimitNotFound(QuotaError):
     code, status = "not_found", 404
 
 
+class RevisionConflict(QuotaError):
+    code, status = "revision_conflict", 409
+
+
 class OverQuota(QuotaError):
     code, status = "over_quota", 429
 
@@ -187,6 +191,23 @@ def validate_limit(payload: Any) -> Limit:
     return Limit(int(capacity), float(rate))
 
 
+def validate_if_match(value: Any) -> int:
+    """The If-Match precondition on PUT /v1/limits/{key}: exactly one double-quoted decimal
+    positive integer — no sign, no whitespace, no list, no weak/`*` form. Anything else is
+    invalid_request, decided before the lock alongside the body validation, so a rejected
+    request never produces a partial configuration or any state change."""
+    if not isinstance(value, str) or len(value) < 3 or not value.startswith('"') \
+            or not value.endswith('"'):
+        raise InvalidRequest('If-Match must be one quoted decimal revision, e.g. "3"')
+    digits = value[1:-1]
+    if not all("0" <= char <= "9" for char in digits):
+        raise InvalidRequest('If-Match must be one quoted decimal revision, e.g. "3"')
+    revision = int(digits)
+    if revision < 1:
+        raise InvalidRequest('If-Match must be one quoted decimal revision, e.g. "3"')
+    return revision
+
+
 def validate_window(payload: Any) -> WindowConfig:
     if not isinstance(payload, dict):
         raise InvalidRequest("body must be a JSON object")
@@ -220,6 +241,11 @@ class Limiter:
         self._lock = threading.RLock()
         self._limits: dict[str, Limit] = {}
         self._buckets: dict[str, Bucket] = {}
+        # Per-key configuration revision for optimistic concurrency: 1 at first creation, +1 on
+        # every successful PUT (even an identical one). Read and written only inside the lock, so
+        # a concurrent If-Match judgement and the update it guards are one atomic step. It tracks
+        # the configuration only — never tokens, used, ledger or window state.
+        self._revisions: dict[str, int] = {}
         self._reservations: dict[str, Reservation] = {}
         # Confirmed holds leave the active registry for good; the value is the exact first consume
         # response, replayed verbatim for idempotent retries (used is never booked a second time).
@@ -269,15 +295,31 @@ class Limiter:
             self._watermark = reading
         return self._watermark
 
-    def configure(self, key: Any, payload: Any) -> Limit:
+    def configure(self, key: Any, payload: Any, if_match: int | None = None) -> tuple[Limit, int]:
+        """Create or hot-reconfigure a key's limit, returning the limit and its new revision.
+
+        `if_match` is the already-validated If-Match revision (None = unconditional update, the
+        baseline behaviour). The precondition is judged inside the same critical section as the
+        update itself, before the clock is even sampled: a mismatch is 409 and an unconfigured key
+        is 404, and neither touches the limit, bucket, used, reservations, ledger, decision
+        counters or the clock watermark. Every successful PUT increments the revision, even when
+        the new configuration is identical to the old.
+        """
         key = validate_key(key)
         limit = validate_limit(payload)
         with self._lock:
+            revision = self._revisions.get(key, 0)
+            if if_match is not None:
+                if key not in self._limits:
+                    raise LimitNotFound(f"no limit configured for {key!r}")
+                if if_match != revision:
+                    raise RevisionConflict("If-Match revision does not match current configuration")
             now = self._tick()
             if key not in self._limits:
                 self._limits[key] = limit
                 self._buckets[key] = Bucket(limit.capacity, now)
-                return limit
+                self._revisions[key] = 1
+                return limit, 1
             # Hot reconfiguration of a live bucket. The wait since the bucket's last effective
             # moment is first refilled at the OLD rate (capped at the OLD capacity); only then is
             # the new configuration installed, so the new rate governs nothing before this moment
@@ -290,7 +332,9 @@ class Limiter:
             bucket = self._buckets[key]
             bucket.tokens = min(float(limit.capacity), bucket.tokens)
             bucket.updated_at = now
-        return limit
+            revision += 1
+            self._revisions[key] = revision
+            return limit, revision
 
     def limit(self, key: str) -> Limit:
         with self._lock:
@@ -607,13 +651,21 @@ class Limiter:
             self._hierarchy_consumed[reservation_id] = snapshot
             return dict(snapshot)
 
-    def state(self, key: str) -> dict[str, Any]:
+    def state_with_revision(self, key: str) -> tuple[dict[str, Any], int]:
+        """The GET /v1/limits/{key} snapshot plus the configuration revision of the SAME critical
+        section, so the ETag a reader sees can never belong to a newer or older configuration than
+        the state next to it."""
         with self._lock:
             now = self._tick()
             limit = self.limit(key)
             self._expire_due(key, now)
             bucket = self._refill(key, now)
-            return {"limit": limit.as_json(), "remaining": int(bucket.tokens), "used": sum(bucket.cost_history)}
+            state = {"limit": limit.as_json(), "remaining": int(bucket.tokens),
+                     "used": sum(bucket.cost_history)}
+            return state, self._revisions[key]
+
+    def state(self, key: str) -> dict[str, Any]:
+        return self.state_with_revision(key)[0]
 
     def ledger(self, key: str, event_limit: int = 100) -> dict[str, Any]:
         """Read-only billing ledger: the accepted spends behind GET /v1/limits/{key}'s `used`.
@@ -813,13 +865,22 @@ def make_handler(limiter: Limiter) -> type[BaseHTTPRequestHandler]:
             assert event_limit is not None
             return event_limit
 
+        def _if_match(self) -> int | None:
+            """The limits PUT's optional optimistic-concurrency precondition, validated before the
+            lock exactly like the body: absent means an unconditional (baseline) update."""
+            value = self.headers.get("If-Match")
+            if value is None:
+                return None
+            return validate_if_match(value)
+
         def do_GET(self) -> None:  # noqa: N802
             try:
                 parts = self._route_segments()
                 if parts == ["health"]:
                     return self._send(200, {"status": "ok"})
                 if len(parts) == 3 and parts[:2] == ["v1", "limits"]:
-                    return self._send(200, limiter.state(parts[2]))
+                    state, revision = limiter.state_with_revision(parts[2])
+                    return self._send(200, state, {"ETag": f'"{revision}"'})
                 if len(parts) == 3 and parts[:2] == ["v1", "ledgers"]:
                     # Route matched first: query validation now beats the key's 404, just as body
                     # validation precedes quota classification everywhere else.
@@ -847,8 +908,11 @@ def make_handler(limiter: Limiter) -> type[BaseHTTPRequestHandler]:
                         window = limiter.configure_window(parts[2], self._read_json())
                         return self._send(200, {"key": parts[2], "window": window.as_json()})
                     return self._send(404, {"error": {"code": "not_found"}})
-                limit = limiter.configure(parts[2], self._read_json())
-                return self._send(200, {"key": parts[2], "limit": limit.as_json()})
+                body = self._read_json()
+                if_match = self._if_match()
+                limit, revision = limiter.configure(parts[2], body, if_match)
+                return self._send(200, {"key": parts[2], "limit": limit.as_json()},
+                                  {"ETag": f'"{revision}"'})
             except QuotaError as error:
                 return self._send(error.status, {"error": {"code": error.code, "message": str(error)}})
             except Exception:
