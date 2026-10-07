@@ -246,13 +246,23 @@ class Limiter:
         limit = validate_limit(payload)
         with self._lock:
             now = self._tick()
-            # Reconfiguration starts with the same lazy expiry settle every other operation does;
-            # the release is credited against the bucket running under the old configuration.
-            self._expire_due(key, now)
+            if key not in self._limits:
+                self._limits[key] = limit
+                self._buckets[key] = Bucket(limit.capacity, now)
+                return limit
+            # Hot reconfiguration of a live key settles under the OLD configuration first:
+            # the bucket is refilled for the whole interval since the last effective moment at
+            # the OLD rate, and due holds are released, so the tokens earned up to this
+            # reconfigure are not swallowed by the swap. Only then is the new config installed
+            # and the balance capped at the NEW capacity. The new rate governs refills from
+            # this effective moment on; it never applies retroactively to the wait before it,
+            # and a larger new capacity never tops the bucket up by itself.
+            self._refill(key, now)
+            self._expire_due(key, now, cap=float(limit.capacity))
             self._limits[key] = limit
-            existing = self._buckets.get(key)
-            self._buckets[key] = Bucket(limit.capacity if existing is None else min(existing.tokens, limit.capacity),
-                                        now, existing.cost_history if existing else [])
+            bucket = self._buckets[key]
+            bucket.tokens = min(bucket.tokens, float(limit.capacity))
+            bucket.updated_at = now
         return limit
 
     def limit(self, key: str) -> Limit:
@@ -270,7 +280,7 @@ class Limiter:
         self._buckets[key] = bucket
         return bucket
 
-    def _expire_due(self, key: str, now: float) -> int:
+    def _expire_due(self, key: str, now: float, cap: float | None = None) -> int:
         """Lazy, deterministic expiry settle: release every reservation of `key` whose TTL has elapsed.
 
         Covers both single-key holds and every cross-layer hold spanning `key`. Each reservation's
@@ -282,6 +292,11 @@ class Limiter:
         Boundary is inclusive (created_at + ttl <= now). Caller holds the lock and supplies the
         operation's single effective moment; a no-op when the key has no due reservations (and
         never touches an unconfigured key).
+
+        `cap` overrides the ceiling applied to THIS key's own refunded tokens — reconfiguration
+        passes the incoming capacity so the settle order is refill under the old config, return
+        each due cost, then cap at the new capacity. Other layers of a cross-layer hold are always
+        capped at their own current (unchanged) capacity.
         """
         due = [rid for rid, reservation in self._reservations.items()
                if reservation.key == key and not reservation.rolled_back
@@ -290,19 +305,26 @@ class Limiter:
                          if key in reservation.keys and reservation.expires_at() <= now]
         if not due and not hierarchy_due:
             return 0
+        key_cap = float(self._limits[key].capacity) if cap is None else cap
         returned = sum(self._reservations[rid].cost for rid in due)
         for rid in due:
             del self._reservations[rid]
+        # Refill first, then credit every refund, then cap once: the key's own share of any
+        # cross-layer refund is credited here together with the single-key refunds, so the
+        # ceiling (current capacity, or the incoming one during reconfiguration) applies to
+        # the fully settled balance exactly once. Other layers cap at their own capacity.
+        bucket = self._refill(key, now)
         own = 0
         for rid in hierarchy_due:
             reservation = self._hierarchy_reservations.pop(rid)
             for layer_key in reservation.keys:
+                if layer_key == key:
+                    continue
                 layer_bucket = self._refill(layer_key, now)
                 layer_bucket.tokens = min(float(self._limits[layer_key].capacity),
                                           layer_bucket.tokens + reservation.cost)
             own += reservation.cost
-        bucket = self._refill(key, now)
-        bucket.tokens = min(float(self._limits[key].capacity), bucket.tokens + returned)
+        bucket.tokens = min(key_cap, bucket.tokens + returned + own)
         return returned + own
 
     def _record_event(self, key: str, source: str, cost: int, reservation_id: str | None,

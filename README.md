@@ -29,8 +29,12 @@ PYTHONPATH=src python3 -m unittest discover -s tests -v
 
 ### `PUT /v1/limits/{key}`
 请求体：`{"capacity": <int 1..1000000>, "refill_per_second": <number > 0>}` → `200 {"key": ..., "limit": {...}}`
-- 重新配置时**保留已用额度**（新桶的初始令牌 = `min(旧令牌, 新 capacity)`）。
-- 未知字段/非法值 ⇒ `400 invalid_request`。
+- 重新配置时**保留已用额度**，并先在**旧配置**下结算到本次有效时刻：到期预留按既有规则返还、
+  桶按**旧** `refill_per_second` 补足从上一有效时刻到本次重配之间经过的时间；随后才安装新配置，
+  把余额封顶到**新** `capacity`（新桶令牌 = `min(旧配置结算后的令牌, 新 capacity)`）。
+  新速率只作用于重配之后的经过时间，不追溯重配前的等待；容量扩大不会凭空把桶补满。
+- 未知字段/非法值 ⇒ `400 invalid_request`，且旧配置、令牌、预留、`used` 与账本完全不变，
+  不推进水位线、不触发到期结算。
 
 ### `POST /v1/check`
 请求体：`{"key": <string>, "cost": <int 1..1000000，缺省 1>}`
@@ -73,7 +77,8 @@ PYTHONPATH=src python3 -m unittest discover -s tests -v
 - 成功：`200 {"reservation_id": ..., "rolled_back": true, "remaining": <int>, "capacity": <int>}`；
   返还后 `remaining` 立即反映且不超过 `capacity`。
 - 重复撤销、未知预留、已自动过期的预留、路径不匹配（段数不对/别的资源）⇒ `404 not_found`；过期释放后再次回滚不会继续增加令牌。
-- 预留期间允许继续检查与重新配置同一 key；重新配置仍保留已用额度（`min(旧令牌, 新 capacity)`）并采用新容量与补充速率，
+- 预留期间允许继续检查与重新配置同一 key；重新配置仍保留已用额度（先在旧配置下补充并结算到期预留，
+  再按 `min(结算后令牌, 新 capacity)` 封顶）并采用新容量与补充速率，
   预留占用的额度在重配前后都被保留，回滚时返还到按新配置运行的桶中；重配不改变预留的到期时刻。
 
 ### `POST /v1/reservations/{reservation_id}/consume`

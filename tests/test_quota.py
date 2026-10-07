@@ -1663,5 +1663,277 @@ class RouteClassificationHttpTests(unittest.TestCase):
         self.assertEqual(self.request("GET", "/health")[0], 200)
 
 
+class ReconfigureRefillUnitTests(unittest.TestCase):
+    """PUT hot reconfiguration settles under the OLD configuration up to the reconfigure's
+    effective moment before the new capacity/rate governs anything."""
+
+    def setUp(self) -> None:
+        self.clock = Clock()
+        self.clock.t = 100.0
+        self.limiter = Limiter(self.clock)
+
+    def test_reconfigure_refills_at_the_old_rate_before_swapping(self) -> None:
+        self.limiter.configure("k", {"capacity": 10, "refill_per_second": 2.0})
+        self.assertTrue(self.limiter.check("k", 10)["allowed"])      # empty at t=100
+        self.clock.t = 103.0
+        self.limiter.configure("k", {"capacity": 10, "refill_per_second": 5.0})
+        # 3 seconds at the OLD rate 2: the new rate 5 never applies retroactively.
+        self.assertEqual(self.limiter.state("k")["remaining"], 6)
+        self.clock.t = 104.0
+        # From the reconfigure on, the NEW rate 5 governs, capped at the new capacity.
+        self.assertEqual(self.limiter.state("k")["remaining"], 10)
+
+    def test_reconfigure_caps_the_old_rate_refill_at_the_new_capacity(self) -> None:
+        self.limiter.configure("k", {"capacity": 10, "refill_per_second": 2.0})
+        self.limiter.check("k", 10)                                  # empty at t=100
+        self.clock.t = 103.0
+        self.limiter.configure("k", {"capacity": 4, "refill_per_second": 5.0})
+        # 6 tokens earned at the old rate, then capped at the new capacity 4.
+        self.assertEqual(self.limiter.state("k")["remaining"], 4)
+        self.clock.t = 104.0
+        self.assertEqual(self.limiter.state("k")["remaining"], 4)    # still capped at 4
+
+    def test_growing_capacity_never_tops_up_the_bucket(self) -> None:
+        self.limiter.configure("k", {"capacity": 10, "refill_per_second": 2.0})
+        self.limiter.check("k", 10)
+        self.clock.t = 103.0
+        self.limiter.configure("k", {"capacity": 100, "refill_per_second": 5.0})
+        self.assertEqual(self.limiter.state("k")["remaining"], 6)    # not 100, not 16
+
+    def test_rate_drop_still_earns_the_old_rate_until_the_swap(self) -> None:
+        self.limiter.configure("k", {"capacity": 10, "refill_per_second": 5.0})
+        self.limiter.check("k", 10)                                  # empty at t=100
+        self.clock.t = 103.0
+        self.limiter.configure("k", {"capacity": 10, "refill_per_second": 1.0})
+        # 3 seconds at the OLD rate 5 = 15, capped at 10; the new rate 1 applies only after.
+        self.assertEqual(self.limiter.state("k")["remaining"], 10)
+        self.clock.t = 104.0
+        self.assertEqual(self.limiter.state("k")["remaining"], 10)
+
+    def test_due_reservation_settles_old_refill_then_refund_then_new_cap(self) -> None:
+        self.limiter.configure("k", {"capacity": 10, "refill_per_second": 1.0})
+        reservation = self.limiter.reserve("k", 8, ttl_seconds=5)    # tokens 2, due 105
+        self.clock.t = 106.0
+        self.limiter.configure("k", {"capacity": 4, "refill_per_second": 1.0})
+        # Old-config refill 2 + 6*1 = 8, refund 8 -> 16, capped at the NEW capacity 4.
+        state = self.limiter.state("k")
+        self.assertEqual((state["remaining"], state["used"]), (4, 0))
+        with self.assertRaises(LimitNotFound):
+            self.limiter.rollback(reservation["reservation_id"])     # refunded exactly once
+
+    def test_due_refund_is_capped_at_the_new_not_the_old_capacity(self) -> None:
+        self.limiter.configure("k", {"capacity": 10, "refill_per_second": 1.0})
+        self.limiter.reserve("k", 8, ttl_seconds=5)                  # tokens 2, due 105
+        self.clock.t = 106.0
+        self.limiter.configure("k", {"capacity": 20, "refill_per_second": 1.0})
+        # Refill 8 under the old config, refund 8 -> 16: the new capacity 20 does not clip
+        # what the old capacity 10 would have.
+        self.assertEqual(self.limiter.state("k")["remaining"], 16)
+
+    def test_live_reservation_survives_and_used_and_ledger_are_untouched(self) -> None:
+        self.limiter.configure("k", {"capacity": 10, "refill_per_second": 1.0})
+        self.limiter.check("k", 2)                                   # tokens 8, used 2
+        reservation = self.limiter.reserve("k", 4, ttl_seconds=100)  # tokens 4
+        self.clock.t = 103.0
+        self.limiter.configure("k", {"capacity": 6, "refill_per_second": 2.0})
+        # Old-rate refill 4 + 3*1 = 7, capped at the new capacity 6; the hold is NOT due.
+        state = self.limiter.state("k")
+        self.assertEqual((state["remaining"], state["used"]), (6, 2))
+        self.assertEqual(self.limiter.ledger("k")["totals"],
+                         {"accepted_count": 1, "accepted_cost": 2})
+        self.assertIn(reservation["reservation_id"], self.limiter._reservations)
+        result = self.limiter.rollback(reservation["reservation_id"])  # still live, refunds once
+        self.assertTrue(result["rolled_back"])
+        self.assertEqual(result["remaining"], 6)                     # 6 + 4 capped at 6
+
+    def test_due_hierarchy_reservation_settles_as_one_unit_at_reconfigure(self) -> None:
+        self.limiter.configure("org", {"capacity": 10, "refill_per_second": 1.0})
+        self.limiter.configure("leaf", {"capacity": 10, "refill_per_second": 1.0})
+        rid = self.limiter.hierarchy_reserve(["org", "leaf"], 6, ttl_seconds=5)["reservation_id"]
+        self.clock.t = 106.0                                         # both layers hold 4, due 105
+        self.limiter.configure("leaf", {"capacity": 3, "refill_per_second": 1.0})
+        # The cross-layer hold lapses as one unit in this same critical section: org is refilled
+        # and refunded under its own (unchanged) capacity, leaf under the old config then capped
+        # at its NEW capacity. No layer is left half-refunded.
+        self.assertEqual(self.limiter.state("org")["remaining"], 10)
+        self.assertEqual(self.limiter.state("leaf")["remaining"], 3)
+        self.assertEqual(self.limiter.state("org")["used"], 0)
+        self.assertEqual(self.limiter.state("leaf")["used"], 0)
+        self.assertEqual(self.limiter._hierarchy_reservations, {})
+        with self.assertRaises(LimitNotFound):
+            self.limiter.hierarchy_rollback(rid)
+
+    def test_stalled_clock_reconfigure_refills_nothing(self) -> None:
+        self.limiter.configure("k", {"capacity": 10, "refill_per_second": 2.0})
+        self.limiter.check("k", 10)                                  # empty at t=100
+        self.limiter.configure("k", {"capacity": 10, "refill_per_second": 5.0})  # same instant
+        self.assertEqual(self.limiter.state("k")["remaining"], 0)
+
+    def test_reconfigure_under_regression_anchors_and_never_recounts(self) -> None:
+        self.limiter.configure("k", {"capacity": 10, "refill_per_second": 2.0})
+        self.limiter.check("k", 10)                                  # empty at t=100
+        self.clock.t = 90.0                                          # regressed reading
+        self.limiter.configure("k", {"capacity": 10, "refill_per_second": 5.0})
+        self.assertEqual(self.limiter.state("k")["remaining"], 0)    # treated as still t=100
+        self.clock.t = 101.0
+        # Only 100->101 counts, at the new rate; the regressed interval is never recounted.
+        self.assertEqual(self.limiter.state("k")["remaining"], 5)
+        self.clock.t = 103.0
+        self.assertEqual(self.limiter.state("k")["remaining"], 10)   # 5 + 2*5, capped at 10
+
+    def test_invalid_reconfigure_changes_nothing_and_never_ticks(self) -> None:
+        self.limiter.configure("k", {"capacity": 10, "refill_per_second": 1.0})
+        self.limiter.check("k", 6)                                   # tokens 4, used 6
+        reservation = self.limiter.reserve("k", 2, ttl_seconds=5)    # tokens 2, due 105
+        ledger_before = self.limiter.ledger("k", 1000)
+        self.clock.t = 110.0                                         # past the hold's expiry
+        bad_payloads = [
+            {"capacity": 10, "refill_per_second": 1, "extra": 1},    # unknown field
+            {"capacity": True, "refill_per_second": 1},              # boolean capacity
+            {"capacity": 4.5, "refill_per_second": 1},               # float capacity
+            {"capacity": 0, "refill_per_second": 1},                 # capacity too small
+            {"capacity": 1_000_001, "refill_per_second": 1},         # capacity too large
+            {"capacity": 10, "refill_per_second": 0},                # non-positive rate
+            {"capacity": 10, "refill_per_second": -2},
+            {"capacity": 10, "refill_per_second": 1_000_001},        # rate too large
+            {"capacity": 10, "refill_per_second": True},             # boolean rate
+            {"capacity": 10},                                        # missing rate
+            "nope",                                                  # not an object
+        ]
+        for bad in bad_payloads:
+            with self.assertRaises(InvalidRequest, msg=repr(bad)):
+                self.limiter.configure("k", bad)
+        with self.assertRaises(InvalidRequest):                      # invalid key also rejected
+            self.limiter.configure("", {"capacity": 1, "refill_per_second": 1})
+        # The failed reconfigures never sampled the clock: the watermark is still 100, so at
+        # t=104 the hold is not yet due and only 4 seconds of refill have accrued. Had any
+        # rejection ticked, the watermark would pin 110, refund the hold early and show 10.
+        self.clock.t = 104.0
+        state = self.limiter.state("k")
+        self.assertEqual((state["remaining"], state["used"]), (6, 6))
+        self.assertEqual(state["limit"], {"capacity": 10, "refill_per_second": 1.0})
+        self.assertEqual(self.limiter.ledger("k", 1000), ledger_before)
+        self.assertIn(reservation["reservation_id"], self.limiter._reservations)
+        self.clock.t = 105.0                                         # the hold lapses on schedule
+        self.assertEqual(self.limiter.state("k")["remaining"], 9)    # 7 + 2 refunded
+
+    def test_concurrent_reconfigure_and_spending_serialize_without_oversell(self) -> None:
+        limiter = Limiter(self.clock)                                # clock frozen at t=100
+        limiter.configure("hot", {"capacity": 100, "refill_per_second": 0.0001})
+        outcomes: list[bool] = []
+        errors: list[BaseException] = []
+        lock = threading.Lock()
+
+        def spend() -> None:
+            try:
+                limiter.check("hot", 1)
+                ok = True
+            except OverQuota:
+                ok = False
+            except BaseException as error:  # noqa: BLE001
+                with lock:
+                    errors.append(error)
+                return
+            with lock:
+                outcomes.append(ok)
+
+        def reconfigure(capacity: int) -> None:
+            try:
+                limiter.configure("hot", {"capacity": capacity, "refill_per_second": 0.0001})
+            except BaseException as error:  # noqa: BLE001
+                with lock:
+                    errors.append(error)
+
+        threads = []
+        for index in range(200):
+            threads.append(threading.Thread(target=spend))
+            if index % 4 == 0:                                       # 50 reconfigures interleaved
+                threads.append(threading.Thread(target=reconfigure, args=(100 + (index % 3) * 50,)))
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(errors, [])
+        # No reconfiguration conjured or destroyed tokens: exactly the 100 held tokens were spent.
+        self.assertEqual(sum(outcomes), 100)
+        state = limiter.state("hot")
+        self.assertEqual((state["remaining"], state["used"]), (0, 100))
+
+
+class ReconfigureRefillHttpTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        from quota import serve
+
+        cls.clock = Clock()
+        cls.server = serve(port=0, now=cls.clock)
+        cls.port = cls.server.server_address[1]
+        threading.Thread(target=cls.server.serve_forever, daemon=True).start()
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.server.shutdown()
+
+    def request(self, method: str, path: str, body: dict | None = None) -> tuple[int, dict, dict]:
+        data = None if body is None else json.dumps(body).encode()
+        request = urllib.request.Request(f"http://127.0.0.1:{self.port}{path}", data=data, method=method,
+                                         headers={"Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(request, timeout=5) as response:
+                return response.status, json.loads(response.read() or b"{}"), dict(response.headers)
+        except urllib.error.HTTPError as error:
+            return error.code, json.loads(error.read() or b"{}"), dict(error.headers)
+
+    def test_put_refills_at_the_old_rate_then_applies_the_new_one(self) -> None:
+        clock = type(self).clock
+        clock.t = 300.0                                              # a fresh, dominant watermark
+        self.request("PUT", "/v1/limits/rc-1", {"capacity": 10, "refill_per_second": 2})
+        status, body, _ = self.request("POST", "/v1/check", {"key": "rc-1", "cost": 10})
+        self.assertEqual((status, body["remaining"]), (200, 0))      # empty at t=300
+        clock.t = 303.0
+        status, body, _ = self.request("PUT", "/v1/limits/rc-1", {"capacity": 10, "refill_per_second": 5})
+        self.assertEqual((status, body["limit"]), (200, {"capacity": 10, "refill_per_second": 5.0}))
+        _, state, _ = self.request("GET", "/v1/limits/rc-1")
+        self.assertEqual(state["remaining"], 6)                      # 3s at the OLD rate 2
+        clock.t = 304.0
+        _, state, _ = self.request("GET", "/v1/limits/rc-1")
+        self.assertEqual(state["remaining"], 10)                     # 6 + 1s at the NEW rate 5
+
+    def test_put_caps_the_old_rate_refill_at_a_smaller_new_capacity(self) -> None:
+        clock = type(self).clock
+        clock.t = 200.0                                              # a fresh, dominant watermark
+        self.request("PUT", "/v1/limits/rc-2", {"capacity": 10, "refill_per_second": 2})
+        self.request("POST", "/v1/check", {"key": "rc-2", "cost": 10})
+        clock.t = 203.0
+        status, _, _ = self.request("PUT", "/v1/limits/rc-2", {"capacity": 4, "refill_per_second": 5})
+        self.assertEqual(status, 200)
+        _, state, _ = self.request("GET", "/v1/limits/rc-2")
+        self.assertEqual(state["remaining"], 4)                      # 6 earned, capped at 4
+        clock.t = 204.0
+        _, state, _ = self.request("GET", "/v1/limits/rc-2")
+        self.assertEqual(state["remaining"], 4)                      # still capped at 4
+
+    def test_invalid_put_is_400_and_leaves_state_and_clock_untouched(self) -> None:
+        clock = type(self).clock
+        clock.t = 100.0
+        self.request("PUT", "/v1/limits/rc-3", {"capacity": 5, "refill_per_second": 1})
+        self.request("POST", "/v1/check", {"key": "rc-3", "cost": 5})  # empty at t=100
+        clock.t = 110.0
+        for body in [{"capacity": 5, "refill_per_second": 1, "extra": 1},
+                     {"capacity": True, "refill_per_second": 1},
+                     {"capacity": 2.5, "refill_per_second": 1},
+                     {"capacity": 0, "refill_per_second": 1},
+                     {"capacity": 5, "refill_per_second": 0},
+                     {"capacity": 5, "refill_per_second": -1},
+                     {"capacity": 5, "refill_per_second": 1_000_001}]:
+            status, parsed, _ = self.request("PUT", "/v1/limits/rc-3", body)
+            self.assertEqual((status, parsed["error"]["code"]), (400, "invalid_request"), body)
+        clock.t = 103.0
+        _, state, _ = self.request("GET", "/v1/limits/rc-3")
+        # The rejections never ticked: only 100->103 refills, and the old config still governs.
+        self.assertEqual((state["remaining"], state["used"]), (3, 5))
+        self.assertEqual(state["limit"], {"capacity": 5, "refill_per_second": 1.0})
+
+
 if __name__ == "__main__":
     unittest.main()
