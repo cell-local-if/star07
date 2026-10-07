@@ -190,6 +190,26 @@ PYTHONPATH=src python3 -m unittest discover -s tests -v
 - 未配置的 key ⇒ `404 not_found`；`events` 不是 1..1000 内的整数字面量、参数重复或出现任何未知查询参数
   ⇒ `400 invalid_request`（查询校验先于 key 的 404）；路径段数不对或方法不匹配 ⇒ `404 not_found`。
 
+### `GET /v1/reconciliations/{key}`
+**只读对账入口**：在**同一个有效时刻**给出令牌桶视图与账本合计的一份加锁快照。
+- 成功：`200 {"key": ..., "remaining": <int>, "used": <int>, "accepted_count": <int>, "accepted_cost": <int>, "balanced": <bool>}`，
+  恰好这六个字段，**不带 `ETag`**，也不引入 `If-Match`、`Idempotency-Key` 或 `Retry-After` 语义（携带这些头一律忽略）。
+- 一次公开操作只采样一次时钟（高水位线口径）：进入唯一临界区后先按既有水位线规则结算该 key 已到期的单层与跨层预留
+  （每个预留只返还一次，顺序与 `GET /v1/limits/{key}` 完全相同）并补足令牌，然后在**同一临界区**内同时取出
+  桶视图与账本合计，故：
+  - `remaining`、`used` 与同一有效时刻 `GET /v1/limits/{key}` 完全一致（未确认预留不计入 `used`）；
+  - `accepted_count`、`accepted_cost` 与 `GET /v1/ledgers/{key}` 的 `totals` 完全一致；
+  - `used == accepted_cost` 时 `balanced` 为 `true`，否则为 `false`。
+- 除到期预留的惰性结算外，本入口**不改变任何状态**：不追加账本事件、不推进 revision、不改变 ETag、
+  不增加五类决策计数、不重复结算预留（本次结算是任何后续入口都会执行的同一次惰性结算）。
+- 查询在**一次加锁快照**内完成，不受并发 check、层级 check、consume、回滚或配置更新影响：每个调用看到的
+  都是某一有效时刻自洽的一套数值，不会出现桶视图与账本合计来自不同时刻的撕裂结果。
+- 时钟停住时多次调用结果稳定；读数回拨时视为停留在水位线（不补令牌、不提前结算），时钟恢复后回拨区间不重复计入。
+- **不接受查询参数**：携带任意查询串（含 `?`、未知参数）⇒ `400 invalid_request`（查询校验先于 limiter 调用，
+  故不采样时钟）；key 格式非法 ⇒ `400 invalid_request`（锁前校验）；key 合法但未配置 ⇒ `404 not_found`；
+  路径含空段（`//`、尾斜杠）、额外段或方法不是 GET ⇒ `404 not_found`。错误继续使用
+  `{"error":{"code":...,"message":...}}` 结构。
+
 ### `PUT /v1/windows/{key}`
 与令牌桶**彼此独立**的精确滑动窗口限流：创建或更新窗口。请求体只接受
 `{"window_seconds": <int 1..3600>, "max_events": <int 1..1000000>}`（两者均须为非布尔整数，不允许缺省、
@@ -304,7 +324,7 @@ PYTHONPATH=src python3 -m unittest discover -s tests -v
 
 - revision 计数的是**成功配置写入**：首次创建为 1，之后每次成功 PUT（含配置完全相同的 PUT）+1；
   `400`/`404`/`429`/`409` 都不推进 revision，也不改变 ETag。
-- ETag 仅与单键限额配置关联：ledgers、windows、leaky-buckets、metrics、check、reservations、hierarchies 响应均不带 ETag；
+- ETag 仅与单键限额配置关联：ledgers、reconciliations、windows、leaky-buckets、metrics、check、reservations、hierarchies 响应均不带 ETag；
   同名窗口、漏桶与令牌桶继续隔离，窗口/漏桶 PUT/GET 不影响同名限额的 revision。
 - revision 判断与更新在**同一把锁**内完成；PUT 的 ETag 命名本次安装的 revision，GET 的 ETag 与同一快照的
   状态在同一临界区取出。并发的两个同版本条件 PUT 中恰好一个成功（200，revision+1），另一个 409；后续若用

@@ -920,6 +920,41 @@ class Limiter:
                 "events": [event.as_json() for event in events[-event_limit:]],
             }
 
+    def reconcile(self, key: Any) -> dict[str, Any]:
+        """The GET /v1/reconciliations/{key} read-only reconciliation snapshot.
+
+        One locked critical section, exactly like every other public operation: the key rule
+        runs before the lock, and inside it the clock is sampled once and clamped to the
+        high-water mark. At that single effective moment the key's due holds — single-key and
+        cross-layer alike — are settled (each refunding its cost at most once) and the bucket is
+        refilled by the watermark rules, exactly as GET /v1/limits/{key} would, while the
+        ledger's totals are copied in the SAME critical section, exactly as GET /v1/ledgers/{key}
+        sees them. The returned remaining/used therefore match a same-instant limits read and
+        accepted_count/accepted_cost match the ledger's totals; ``balanced`` is true precisely
+        when used equals accepted_cost.
+
+        Despite settling due holds, this is a read: it appends no ledger event, advances no
+        revision, changes no ETag, counts no decision and books no usage, so a due reservation is
+        never "settled twice" — the one lazy settle this performs is the same settle the next
+        limits/check/consume would have performed. A stalled clock yields a stable answer; a
+        regressed reading is treated as "time stayed at the watermark", and after recovery the
+        regressed interval is never recounted.
+        """
+        key = validate_key(key)
+        with self._lock:
+            now = self._tick()
+            if key not in self._limits:
+                raise LimitNotFound(f"no limit configured for {key!r}")
+            self._expire_due(key, now)
+            bucket = self._refill(key, now)
+            events = self._ledgers.get(key, [])
+            accepted_count = len(events)
+            accepted_cost = sum(event.cost for event in events)
+            used = sum(bucket.cost_history)
+            return {"key": key, "remaining": int(bucket.tokens), "used": used,
+                    "accepted_count": accepted_count, "accepted_cost": accepted_cost,
+                    "balanced": used == accepted_cost}
+
     def _expire_window(self, window: SlidingWindow, now: float) -> None:
         """Drop every window event whose age has reached window_seconds at this effective moment.
 
@@ -1197,6 +1232,14 @@ def make_handler(limiter: Limiter) -> type[BaseHTTPRequestHandler]:
                     # validation precedes quota classification everywhere else.
                     event_limit = self._ledger_event_limit()
                     return self._send(200, limiter.ledger(parts[2], event_limit))
+                if len(parts) == 3 and parts[:2] == ["v1", "reconciliations"]:
+                    # The reconciliation read names no query parameters: any query string is
+                    # invalid_request, decided before the limiter call (and hence before the
+                    # clock is sampled or the watermark advances). The success body carries no
+                    # ETag and the route honors no If-Match, Idempotency-Key or Retry-After.
+                    if self._query_string() != "":
+                        raise InvalidRequest("GET /v1/reconciliations/{key} takes no query parameters")
+                    return self._send(200, limiter.reconcile(parts[2]))
                 if len(parts) == 3 and parts[:2] == ["v1", "windows"]:
                     return self._send(200, limiter.window_state(parts[2]))
                 if len(parts) == 3 and parts[:2] == ["v1", "leaky-buckets"]:
