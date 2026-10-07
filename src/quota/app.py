@@ -56,7 +56,7 @@ class LedgerEvent:
     confirmed reservations only."""
 
     seq: int
-    source: str  # "check" | "hierarchy_check" | "reservation_consume"
+    source: str  # "check" | "hierarchy_check" | "reservation_consume" | "hierarchy_reservation_consume"
     reservation_id: str | None
     cost: int
     remaining: int
@@ -77,6 +77,26 @@ class Reservation:
     created_at: float
     ttl_seconds: int
     rolled_back: bool = False
+
+    def expires_at(self) -> float:
+        return self.created_at + self.ttl_seconds
+
+
+@dataclass
+class HierarchyReservation:
+    """One cross-layer hold: `cost` tokens held on every layer of `keys` simultaneously.
+
+    Lives in its own registry, shares the single-key holds' lock, clock watermark and lazy
+    expiry rule (created_at + ttl_seconds, boundary inclusive). It is all-or-nothing in both
+    directions: created only when every layer can pay, and settled — by expiry, rollback or
+    consume — as one unit, so no layer is ever left half-held or half-refunded.
+    """
+
+    reservation_id: str
+    keys: list[str]
+    cost: int
+    created_at: float
+    ttl_seconds: int
 
     def expires_at(self) -> float:
         return self.created_at + self.ttl_seconds
@@ -199,6 +219,11 @@ class Limiter:
         # Confirmed holds leave the active registry for good; the value is the exact first consume
         # response, replayed verbatim for idempotent retries (used is never booked a second time).
         self._consumed: dict[str, dict[str, Any]] = {}
+        # Cross-layer holds and their confirmed-consume replays, in namespaces of their own: a
+        # reservation_id created here never resolves through the single-key endpoints and vice
+        # versa (cross-resource identifiers are 404, not confusion).
+        self._hierarchy_reservations: dict[str, HierarchyReservation] = {}
+        self._hierarchy_consumed: dict[str, dict[str, Any]] = {}
         # Append-only billing ledger per key: one entry per accepted check and per first consume.
         # Entries are appended inside the lock at booking time, so seq is dense and gap-free even
         # under concurrent settling; the list is never trimmed (read-only views take a tail slice).
@@ -248,23 +273,37 @@ class Limiter:
     def _expire_due(self, key: str, now: float) -> int:
         """Lazy, deterministic expiry settle: release every reservation of `key` whose TTL has elapsed.
 
-        Each reservation's cost is returned at most once: it is removed from the registry before the
-        bucket is credited. The bucket refills by elapsed time first, then the returned cost is capped
-        at the key's current capacity. Boundary is inclusive (created_at + ttl <= now). Caller holds
-        the lock and supplies the operation's single effective moment; a no-op when the key has no
-        due reservations (and never touches an unconfigured key).
+        Covers both single-key holds and every cross-layer hold spanning `key`. Each reservation's
+        cost is returned at most once: it is removed from its registry before any bucket is
+        credited. A cross-layer hold lapses as one unit — all of its layers are refilled and
+        credited in this same critical section, each capped at its own current capacity — so no
+        layer ever observes a half-expired hold or is refunded twice for it. The bucket refills by
+        elapsed time first, then the returned cost is capped at the key's current capacity.
+        Boundary is inclusive (created_at + ttl <= now). Caller holds the lock and supplies the
+        operation's single effective moment; a no-op when the key has no due reservations (and
+        never touches an unconfigured key).
         """
         due = [rid for rid, reservation in self._reservations.items()
                if reservation.key == key and not reservation.rolled_back
                and reservation.expires_at() <= now]
-        if not due:
+        hierarchy_due = [rid for rid, reservation in self._hierarchy_reservations.items()
+                         if key in reservation.keys and reservation.expires_at() <= now]
+        if not due and not hierarchy_due:
             return 0
         returned = sum(self._reservations[rid].cost for rid in due)
         for rid in due:
             del self._reservations[rid]
+        own = 0
+        for rid in hierarchy_due:
+            reservation = self._hierarchy_reservations.pop(rid)
+            for layer_key in reservation.keys:
+                layer_bucket = self._refill(layer_key, now)
+                layer_bucket.tokens = min(float(self._limits[layer_key].capacity),
+                                          layer_bucket.tokens + reservation.cost)
+            own += reservation.cost
         bucket = self._refill(key, now)
         bucket.tokens = min(float(self._limits[key].capacity), bucket.tokens + returned)
-        return returned
+        return returned + own
 
     def _record_event(self, key: str, source: str, cost: int, reservation_id: str | None,
                       remaining: float, capacity: int, effective_at: float) -> None:
@@ -336,6 +375,48 @@ class Limiter:
                 self._record_event(key, "hierarchy_check", cost, None, bucket.tokens, limit.capacity, now)
                 layers.append({"key": key, "remaining": int(bucket.tokens), "capacity": limit.capacity})
             return {"allowed": True, "cost": cost, "layers": layers}
+
+    def hierarchy_reserve(self, keys: Any, cost: Any,
+                          ttl_seconds: Any = DEFAULT_TTL_SECONDS) -> dict[str, Any]:
+        """Atomically hold `cost` tokens on every layer of a hierarchy, without booking them as used.
+
+        Same critical section, same single effective moment and same all-or-nothing judgement as
+        hierarchy_check: validation happens before the lock, configuration is confirmed for every
+        layer in input order (the 404 names the first unconfigured key), then each layer's due
+        holds — single-key and cross-layer alike — are settled and its bucket refilled at this one
+        moment. Either every layer can pay and all are deducted together, or none is touched and
+        the rejection hints the longest wait any insufficient layer needs to cover its own deficit.
+        The hold books no used and no ledger event; that happens only at consume time. It lapses
+        `ttl_seconds` of monotonic time after creation; reconfiguring a layer never extends it.
+        """
+        keys = validate_keys(keys)
+        cost = validate_cost(cost)
+        ttl_seconds = validate_ttl(ttl_seconds)
+        with self._lock:
+            now = self._tick()
+            for key in keys:
+                if key not in self._limits:
+                    raise LimitNotFound(f"no limit configured for {key!r}")
+            buckets = []
+            for key in keys:
+                self._expire_due(key, now)
+                buckets.append(self._refill(key, now))
+            shortfalls = [(key, bucket) for key, bucket in zip(keys, buckets) if bucket.tokens < cost]
+            if shortfalls:
+                retry_after = max((cost - bucket.tokens) / self._limits[key].refill_per_second
+                                  for key, bucket in shortfalls)
+                raise OverQuota(
+                    f"hierarchy layers short of cost {cost}: "
+                    + ", ".join(f"{key!r} has {bucket.tokens:.3f}" for key, bucket in shortfalls),
+                    retry_after)
+            for bucket in buckets:
+                bucket.tokens -= cost
+            reservation = HierarchyReservation(uuid.uuid4().hex, list(keys), cost, now, ttl_seconds)
+            self._hierarchy_reservations[reservation.reservation_id] = reservation
+            layers = [{"key": key, "remaining": int(bucket.tokens), "capacity": self._limits[key].capacity}
+                      for key, bucket in zip(keys, buckets)]
+            return {"reservation_id": reservation.reservation_id, "keys": list(keys), "cost": cost,
+                    "ttl_seconds": ttl_seconds, "layers": layers}
 
     def reserve(self, key: Any, cost: Any, ttl_seconds: Any = DEFAULT_TTL_SECONDS) -> dict[str, Any]:
         """Atomically hold `cost` tokens, exactly as check() judges them, without booking them as used.
@@ -415,6 +496,69 @@ class Limiter:
                         "remaining": int(bucket.tokens), "capacity": limit.capacity,
                         "used": sum(bucket.cost_history)}
             self._consumed[reservation_id] = snapshot
+            return dict(snapshot)
+
+    def hierarchy_rollback(self, reservation_id: str) -> dict[str, Any]:
+        """Cancel a live cross-layer hold exactly once: every layer gets the held cost back.
+
+        The same lazy settle runs first on each layer, so a hold whose TTL has elapsed has already
+        been refunded as one unit and is unknown to this endpoint (404) — as are repeated
+        rollbacks, unknown identifiers, single-key reservation identifiers and confirmed holds
+        (a confirmed hold left the registry at consume time and is never refunded). Each layer is
+        refilled by elapsed time first, then credited the creation-time cost capped at its current
+        capacity, all inside the one critical section: no partial refunds.
+        """
+        with self._lock:
+            now = self._tick()
+            reservation = self._hierarchy_reservations.get(reservation_id)
+            if reservation is None:
+                raise LimitNotFound(f"no rollbackable reservation {reservation_id!r}")
+            for key in reservation.keys:
+                self._expire_due(key, now)
+            reservation = self._hierarchy_reservations.pop(reservation_id, None)
+            if reservation is None:
+                raise LimitNotFound(f"no rollbackable reservation {reservation_id!r}")
+            layers = []
+            for key in reservation.keys:
+                limit = self._limits[key]
+                bucket = self._refill(key, now)
+                bucket.tokens = min(float(limit.capacity), bucket.tokens + reservation.cost)
+                layers.append({"key": key, "remaining": int(bucket.tokens), "capacity": limit.capacity})
+            return {"reservation_id": reservation_id, "rolled_back": True, "layers": layers}
+
+    def hierarchy_consume(self, reservation_id: str) -> dict[str, Any]:
+        """Confirm a live cross-layer hold as real usage on every layer.
+
+        Every layer's due holds are settled first, exactly as the single-key consume settles its
+        key. The target hold's cost was already taken from each bucket at reserve time, so here it
+        is booked once per layer into used — no extra deduction, no refund — and each layer's
+        ledger gains one event with source "hierarchy_reservation_consume" carrying the shared
+        reservation_id. Repeating the call replays the first response byte for byte and never
+        books used again; an expired, rolled-back or unknown hold is 404 and is never booked later.
+        """
+        with self._lock:
+            now = self._tick()
+            snapshot = self._hierarchy_consumed.get(reservation_id)
+            if snapshot is not None:
+                return dict(snapshot)
+            reservation = self._hierarchy_reservations.get(reservation_id)
+            if reservation is None:
+                raise LimitNotFound(f"no consumable reservation {reservation_id!r}")
+            for key in reservation.keys:
+                self._expire_due(key, now)
+            reservation = self._hierarchy_reservations.pop(reservation_id, None)
+            if reservation is None:
+                raise LimitNotFound(f"no consumable reservation {reservation_id!r}")
+            layers = []
+            for key in reservation.keys:
+                limit = self._limits[key]
+                bucket = self._refill(key, now)
+                bucket.cost_history.append(reservation.cost)
+                self._record_event(key, "hierarchy_reservation_consume", reservation.cost,
+                                   reservation_id, bucket.tokens, limit.capacity, now)
+                layers.append({"key": key, "remaining": int(bucket.tokens), "capacity": limit.capacity})
+            snapshot = {"reservation_id": reservation_id, "consumed": True, "layers": layers}
+            self._hierarchy_consumed[reservation_id] = snapshot
             return dict(snapshot)
 
     def state(self, key: str) -> dict[str, Any]:
@@ -664,6 +808,23 @@ def make_handler(limiter: Limiter) -> type[BaseHTTPRequestHandler]:
                         raise InvalidRequest('body must be {"keys": [<string>, ...], "cost": <integer>}')
                     result = limiter.hierarchy_check(body["keys"], body.get("cost", 1))
                     return self._send(200, result)
+                if parts == ["v1", "hierarchies", "reservations"]:
+                    body = self._read_json()
+                    if not isinstance(body, dict) or "keys" not in body \
+                            or set(body) - {"keys", "cost", "ttl_seconds"}:
+                        raise InvalidRequest(
+                            'body must be {"keys": [<string>, ...], "cost": <integer>, '
+                            '"ttl_seconds": <integer 1..86400>}')
+                    ttl = body.get("ttl_seconds", DEFAULT_TTL_SECONDS)
+                    result = limiter.hierarchy_reserve(body["keys"], body.get("cost", 1), ttl)
+                    return self._send(200, result)
+                if len(parts) == 5 and parts[:3] == ["v1", "hierarchies", "reservations"] \
+                        and parts[4] == "consume":
+                    body = self._read_json()
+                    if not isinstance(body, dict) or body:
+                        raise InvalidRequest('body must be an empty JSON object {}')
+                    result = limiter.hierarchy_consume(parts[3])
+                    return self._send(200, result)
                 if parts == ["v1", "reservations"]:
                     body = self._read_json()
                     if not isinstance(body, dict) or set(body) - {"key", "cost", "ttl_seconds"}:
@@ -697,10 +858,13 @@ def make_handler(limiter: Limiter) -> type[BaseHTTPRequestHandler]:
         def do_DELETE(self) -> None:  # noqa: N802
             try:
                 parts = self._route_segments()
-                if len(parts) != 3 or parts[:2] != ["v1", "reservations"]:
-                    return self._send(404, {"error": {"code": "not_found"}})
-                result = limiter.rollback(parts[2])
-                return self._send(200, result)
+                if len(parts) == 3 and parts[:2] == ["v1", "reservations"]:
+                    result = limiter.rollback(parts[2])
+                    return self._send(200, result)
+                if len(parts) == 4 and parts[:3] == ["v1", "hierarchies", "reservations"]:
+                    result = limiter.hierarchy_rollback(parts[3])
+                    return self._send(200, result)
+                return self._send(404, {"error": {"code": "not_found"}})
             except QuotaError as error:
                 return self._send(error.status, {"error": {"code": error.code, "message": str(error)}})
             except Exception:

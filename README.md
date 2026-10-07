@@ -91,6 +91,37 @@ PYTHONPATH=src python3 -m unittest discover -s tests -v
 - 重配同一 key 后确认：落账 `cost` 仍按预留创建时数值，`remaining`/`capacity` 采用新容量与补充速率的当前值。
 - 与 check/reserve/expire/rollback 共用同一把锁、同一套原子额度判断：不会超卖、退款后又落账或重复累计 `used`。
 
+### `POST /v1/hierarchies/reservations`
+**跨层预留**：在层级即时扣减同一套键上做一次全有或全无的预留。请求体：
+`{"keys": [<string>, ...], "cost": <int 1..1000000，缺省 1>, "ttl_seconds": <int 1..86400，缺省 60>}`，
+`keys`/`cost`/`ttl_seconds` 规则分别与 `hierarchies/check` 和单键预留相同。
+- 成功：`200 {"reservation_id": ..., "keys": [...], "cost": <int>, "ttl_seconds": <int>, "layers": [{"key": ..., "remaining": <int>, "capacity": <int>}, ...]}`，
+  `layers` 按 `keys` 输入顺序；每层立即扣 `cost`（`remaining` 立即反映）但 **`used` 不变、账本不写**。
+- 与单键预留、层级扣减**共用同一临界区与同一次时钟采样**：先按输入顺序确认每层均已配置
+  （否则 `404 not_found`，`message` 指明第一个未配置的 key），再对每层结算到期的单层与跨层预留并补充令牌，
+  最后同时判断。任一层不足 ⇒ 整体 `429 over_quota`，各层不扣减、不落账；`Retry-After` 取所有不足层
+  各自 deficit 补齐时间的**最大值**，毫秒向上取整三位小数。
+- 非法输入（缺 `keys`、未知字段、`keys`/`cost`/`ttl_seconds` 非法）⇒ `400 invalid_request`，不创建预留、不扣减。
+- 跨层预留按创建时刻 `+ ttl_seconds` **惰性过期**（边界取大于等于）；任何额度入口开始时一并结算到期的
+  单层与跨层预留，一个跨层预留过期时其**所有层在同一临界区内各返还一次**并按各自当前 `capacity` 封顶；
+  重配任一层不延长 TTL。
+
+### `DELETE /v1/hierarchies/reservations/{reservation_id}`
+撤销一个未过期、未确认的跨层预留：把 `cost` 退回**全部层**（各层先按时间补充，再按各自当前 `capacity` 封顶）。
+- 成功：`200 {"reservation_id": ..., "rolled_back": true, "layers": [{"key": ..., "remaining": <int>, "capacity": <int>}, ...]}`。
+- 重复撤销、未知标识、已过期、已确认的预留，以及把单键预留标识用到本路由 ⇒ `404 not_found`；
+  已确认预留不退款。全部层在同一临界区内返还，不存在部分退款。
+
+### `POST /v1/hierarchies/reservations/{reservation_id}/consume`
+确认一个跨层预留为实际消耗。请求体**必须是空 JSON 对象 `{}`**。
+- 命中时先对每层按既有规则结算到期预留，再确认：预留的 `cost` 在创建时已扣，此处**不再扣令牌、不退款**，
+  每层 `used` 各增加一次，并各落一条 `source` 为 `"hierarchy_reservation_consume"`、`reservation_id` 为该标识的账本事件。
+- 成功：`200 {"reservation_id": ..., "consumed": true, "layers": [{"key": ..., "remaining": <int>, "capacity": <int>}, ...]}`；
+  重配后确认的，`cost` 取创建时数值，`remaining`/`capacity` 取新配置当前值。
+- **幂等**：重复 consume 原样重放首次响应，不重复落账、不重复增加 `used`。
+- 未知、已过期、已撤销、已确认后交叉访问 DELETE，或把单键预留标识用到本路由 ⇒ `404 not_found`；
+  路径段数不对、末段不是 `consume`、方法不匹配 ⇒ 先 `404` 且不读体；坏 JSON、未知字段、非空体 ⇒ `400 invalid_request`。
+
 ### `GET /v1/limits/{key}`
 `200 {"limit": {...}, "remaining": <int>, "used": <int>}`（读取也会先按时间补充，体现当前余量；未确认的预留不计入 `used`）。
 
@@ -99,8 +130,8 @@ PYTHONPATH=src python3 -m unittest discover -s tests -v
 - 查询参数（可选）：`events=<int 1..1000>`，按 `seq` 升序返回最近的若干条事件；缺省 `100`。
 - 成功：`200 {"key": ..., "totals": {"accepted_count": <int>, "accepted_cost": <int>}, "events": [...]}`。
   `totals.accepted_cost` 恒等于同一状态下 `GET /v1/limits/{key}` 的 `used`；`accepted_count` 为事件总数（不受 `events` 窗口影响）。
-- 每条事件固定为 `{"seq": <int 从 1 起每 key 连续递增>, "source": "check"|"hierarchy_check"|"reservation_consume", "reservation_id": <string|null>, "cost": <int>, "remaining": <int>, "capacity": <int>, "effective_at": <float>}`：
-  - 成功的 `check`、成功的层级 `hierarchies/check`（每层一条）与成功的（首次）consume 各生成且只生成一条；`check` 事件的 `reservation_id` 为 `null`，
+- 每条事件固定为 `{"seq": <int 从 1 起每 key 连续递增>, "source": "check"|"hierarchy_check"|"reservation_consume"|"hierarchy_reservation_consume", "reservation_id": <string|null>, "cost": <int>, "remaining": <int>, "capacity": <int>, "effective_at": <float>}`：
+  - 成功的 `check`、成功的层级 `hierarchies/check`（每层一条）、成功的（首次）consume 与成功的（首次）跨层 consume（每层一条）各生成且只生成一条；`check` 事件的 `reservation_id` 为 `null`，
     consume 事件使用原预留标识。重复 consume 幂等重放、不追加；令牌不足、回滚、过期结算与各类校验失败均不生成事件。
   - `cost` 为实际记账数；`remaining`/`capacity` 取记账完成临界区内的数值；`effective_at` 为产生该事件的公开操作
     在同一临界区内采样的有效时刻（高水位线口径）。

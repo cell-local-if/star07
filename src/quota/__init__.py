@@ -3,6 +3,7 @@
 from .app import (  # noqa: F401
     Bucket,
     DEFAULT_TTL_SECONDS,
+    HierarchyReservation,
     InvalidRequest,
     LedgerEvent,
     Limit,
@@ -22,7 +23,7 @@ from .app import (  # noqa: F401
     validate_window,
 )
 
-__all__ = ["Bucket", "DEFAULT_TTL_SECONDS", "InvalidRequest", "LedgerEvent", "Limit",
-           "LimitNotFound", "Limiter", "OverQuota", "QuotaError", "Reservation", "SlidingWindow",
-           "WindowConfig", "make_handler", "serve", "validate_cost", "validate_key",
+__all__ = ["Bucket", "DEFAULT_TTL_SECONDS", "HierarchyReservation", "InvalidRequest", "LedgerEvent",
+           "Limit", "LimitNotFound", "Limiter", "OverQuota", "QuotaError", "Reservation",
+           "SlidingWindow", "WindowConfig", "make_handler", "serve", "validate_cost", "validate_key",
            "validate_limit", "validate_ttl", "validate_window"]
