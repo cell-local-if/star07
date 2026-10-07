@@ -169,6 +169,23 @@ PYTHONPATH=src python3 -m unittest discover -s tests -v
 返回 check 同一有效时刻下的同一快照：`200 {"window": {...}, "used": <int>, "remaining": <int>}`
 （先淘汰窗外事件再计数；未知窗口 ⇒ `404 not_found`）。
 
+### `GET /v1/metrics`
+**只读累计决策观测**：返回本进程内 Limiter 创建以来五类额度决策的累计次数，形状固定为
+`200 {"metrics": {"decisions": {"check": {"allowed": <int>, "over_quota": <int>}, "hierarchy_check": {...}, "reservation": {...}, "hierarchy_reservation": {...}, "window_check": {...}}}}`。
+- 五个名称依次对应：单键即时检查（`POST /v1/check`）、层级即时检查（`POST /v1/hierarchies/check`）、
+  单键预留创建（`POST /v1/reservations`）、跨层预留创建（`POST /v1/hierarchies/reservations`）、
+  滑动窗口检查（`POST /v1/windows/{key}/check`）。
+- 一次成功决策计一次 `allowed`；一次因额度或窗口不足返回 `429` 的决策计一次 `over_quota`。
+  层级请求**按整个请求计一次**，不按层数累计。
+- 预留的 consume、rollback、过期结算与所有 GET 读取**不计数**；参数校验失败（`400`）、
+  未配置 key 的 `404`、未知路由与错误方法也**不计数**。
+- 计数在同一把锁内随决策精确加一：并发下不丢失、不重复。
+- 读取**只加锁拷贝计数**：不采样时钟、不推进高水位线、不结算预留、不补充令牌、不改账本或窗口历史，
+  时钟停住或回拨不会改变读取结果。
+- 计数只存进程内存并随 Limiter 累计，重启归零，无持久化承诺。
+- 本路由**不带查询参数**：带任意查询参数 ⇒ `400 invalid_request`；路径多段、少段或方法不是 GET
+  ⇒ `404 not_found`，且错误路径与错误方法不读取请求体。
+
 #### 滑动窗口的时间语义（确定性）
 - 有效时刻沿用令牌桶的**单调时钟高水位线**口径，与令牌桶共用同一把锁、同一次 `_tick`：每个公开操作
   进入锁后只采样一次；时钟停住时淘汰截止线不变、不淘汰事件；读数回拨视为停留在水位线，恢复后

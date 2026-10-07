@@ -150,6 +150,11 @@ def validate_keys(keys: Any) -> list[str]:
 
 DEFAULT_TTL_SECONDS = 60
 
+# The five decision kinds counted by GET /v1/metrics, in response order: single-key instant
+# check, hierarchy instant check, single-key reservation creation, cross-layer reservation
+# creation, sliding-window check.
+DECISION_KINDS = ("check", "hierarchy_check", "reservation", "hierarchy_reservation", "window_check")
+
 
 def retry_after_header(retry_after: float) -> str:
     """The single Retry-After rule for every 429: raw seconds needed to refill this rejection's
@@ -233,6 +238,29 @@ class Limiter:
         self._windows: dict[str, SlidingWindow] = {}
         # Highest clock reading ever observed; the effective moment never moves below it.
         self._watermark = float("-inf")
+        # Cumulative per-kind decision counters, process-local and born with the Limiter: one
+        # decision increments exactly one of allowed/over_quota, always inside the lock, so
+        # concurrent decisions can neither lose nor double an increment. Nothing else (consume,
+        # rollback, expiry settling, reads, validation failures, 404s) ever touches them, and a
+        # restart resets them to zero — there is no persistence promise.
+        self._decisions: dict[str, dict[str, int]] = {
+            kind: {"allowed": 0, "over_quota": 0} for kind in DECISION_KINDS
+        }
+
+    def _record_decision(self, kind: str, outcome: str) -> None:
+        """Count one quota decision. Caller holds the lock and the decision has just been made."""
+        self._decisions[kind][outcome] += 1
+
+    def metrics(self) -> dict[str, Any]:
+        """Read-only cumulative decision counts since this Limiter was created.
+
+        Only the lock is taken so the copy is consistent with concurrent decisions: no clock
+        sample, no watermark advance, no reservation settling, no refill, no ledger or window
+        mutation — a stalled or regressed clock cannot change what a read returns.
+        """
+        with self._lock:
+            return {"metrics": {"decisions": {
+                kind: dict(counts) for kind, counts in self._decisions.items()}}}
 
     def _tick(self) -> float:
         """Sample the clock once and clamp to the high-water mark. Caller holds the lock."""
@@ -340,9 +368,11 @@ class Limiter:
                 bucket.tokens -= cost
                 bucket.cost_history.append(cost)
                 self._record_event(key, "check", cost, None, bucket.tokens, limit.capacity, now)
+                self._record_decision("check", "allowed")
                 return {"allowed": True, "remaining": int(bucket.tokens), "capacity": limit.capacity}
             deficit = cost - bucket.tokens
             retry_after = deficit / limit.refill_per_second
+            self._record_decision("check", "over_quota")
             raise OverQuota(f"key {key!r} has {bucket.tokens:.3f} tokens, needs {cost}", retry_after)
 
     def hierarchy_check(self, keys: Any, cost: Any) -> dict[str, Any]:
@@ -372,6 +402,7 @@ class Limiter:
             if shortfalls:
                 retry_after = max((cost - bucket.tokens) / self._limits[key].refill_per_second
                                   for key, bucket in shortfalls)
+                self._record_decision("hierarchy_check", "over_quota")
                 raise OverQuota(
                     f"hierarchy layers short of cost {cost}: "
                     + ", ".join(f"{key!r} has {bucket.tokens:.3f}" for key, bucket in shortfalls),
@@ -383,6 +414,8 @@ class Limiter:
                 limit = self._limits[key]
                 self._record_event(key, "hierarchy_check", cost, None, bucket.tokens, limit.capacity, now)
                 layers.append({"key": key, "remaining": int(bucket.tokens), "capacity": limit.capacity})
+            # The whole hierarchy request is one decision, however many layers it spans.
+            self._record_decision("hierarchy_check", "allowed")
             return {"allowed": True, "cost": cost, "layers": layers}
 
     def hierarchy_reserve(self, keys: Any, cost: Any,
@@ -414,6 +447,7 @@ class Limiter:
             if shortfalls:
                 retry_after = max((cost - bucket.tokens) / self._limits[key].refill_per_second
                                   for key, bucket in shortfalls)
+                self._record_decision("hierarchy_reservation", "over_quota")
                 raise OverQuota(
                     f"hierarchy layers short of cost {cost}: "
                     + ", ".join(f"{key!r} has {bucket.tokens:.3f}" for key, bucket in shortfalls),
@@ -422,6 +456,7 @@ class Limiter:
                 bucket.tokens -= cost
             reservation = HierarchyReservation(uuid.uuid4().hex, list(keys), cost, now, ttl_seconds)
             self._hierarchy_reservations[reservation.reservation_id] = reservation
+            self._record_decision("hierarchy_reservation", "allowed")
             layers = [{"key": key, "remaining": int(bucket.tokens), "capacity": self._limits[key].capacity}
                       for key, bucket in zip(keys, buckets)]
             return {"reservation_id": reservation.reservation_id, "keys": list(keys), "cost": cost,
@@ -443,11 +478,13 @@ class Limiter:
             bucket = self._refill(key, now)
             if bucket.tokens < cost:
                 deficit = cost - bucket.tokens
+                self._record_decision("reservation", "over_quota")
                 raise OverQuota(f"key {key!r} has {bucket.tokens:.3f} tokens, needs {cost}",
                                 deficit / limit.refill_per_second)
             bucket.tokens -= cost
             reservation = Reservation(uuid.uuid4().hex, key, cost, now, ttl_seconds)
             self._reservations[reservation.reservation_id] = reservation
+            self._record_decision("reservation", "allowed")
             return {"reservation_id": reservation.reservation_id, "key": key, "cost": cost,
                     "remaining": int(bucket.tokens), "capacity": limit.capacity,
                     "ttl_seconds": ttl_seconds}
@@ -670,9 +707,11 @@ class Limiter:
             used = len(window.events)
             if used >= config.max_events:
                 retry_after = window.events[0] + config.window_seconds - now
+                self._record_decision("window_check", "over_quota")
                 raise OverQuota(f"window for {key!r} is full: {used}/{config.max_events} events",
                                 retry_after)
             window.events.append(now)
+            self._record_decision("window_check", "allowed")
             used += 1
             return {"allowed": True, "used": used, "remaining": config.max_events - used,
                     "limit": config.max_events, "window_seconds": config.window_seconds}
@@ -743,6 +782,13 @@ def make_handler(limiter: Limiter) -> type[BaseHTTPRequestHandler]:
                 return []
             return segments
 
+        def _query_string(self) -> str:
+            """The raw query string of the request target ("" when absent or bare), read from
+            the request line exactly as routing does."""
+            words = self.requestline.split(" ")
+            target = words[1] if len(words) >= 2 else ""
+            return target.split("?", 1)[1] if "?" in target else ""
+
         def _ledger_event_limit(self) -> int:
             """Parse the ledger endpoint's sole, optional `events` query parameter.
 
@@ -781,6 +827,12 @@ def make_handler(limiter: Limiter) -> type[BaseHTTPRequestHandler]:
                     return self._send(200, limiter.ledger(parts[2], event_limit))
                 if len(parts) == 3 and parts[:2] == ["v1", "windows"]:
                     return self._send(200, limiter.window_state(parts[2]))
+                if parts == ["v1", "metrics"]:
+                    # Read-only cumulative counters. The route takes no query parameters at all:
+                    # any non-empty query string is invalid_request, decided before the read.
+                    if self._query_string() != "":
+                        raise InvalidRequest("GET /v1/metrics takes no query parameters")
+                    return self._send(200, limiter.metrics())
                 return self._send(404, {"error": {"code": "not_found"}})
             except QuotaError as error:
                 return self._send(error.status, {"error": {"code": error.code, "message": str(error)}})
