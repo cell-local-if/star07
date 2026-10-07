@@ -140,6 +140,26 @@ class SlidingWindow:
     events: list[float] = field(default_factory=list)
 
 
+@dataclass(frozen=True)
+class LeakyConfig:
+    """One leaky-bucket configuration: at most capacity units held, leaking leak_per_second per second."""
+
+    capacity: int
+    leak_per_second: float
+
+    def as_json(self) -> dict[str, Any]:
+        return {"capacity": self.capacity, "leak_per_second": self.leak_per_second}
+
+
+@dataclass
+class LeakyBucket:
+    """One independent leaky bucket: the current water level and the effective moment it was last settled."""
+
+    config: LeakyConfig
+    level: float
+    updated_at: float
+
+
 def validate_key(key: Any) -> str:
     if not isinstance(key, str) or not key or len(key) > 200:
         raise InvalidRequest("key must be a non-empty string of at most 200 characters")
@@ -222,6 +242,26 @@ def validate_window(payload: Any) -> WindowConfig:
     return WindowConfig(window_seconds, max_events)
 
 
+def validate_leaky_config(payload: Any) -> LeakyConfig:
+    """The sole accepted shape of PUT /v1/leaky-buckets/{key}'s body.
+
+    Both fields are required; anything else — unknown fields, booleans, out-of-range values —
+    is invalid_request decided before the lock, so a rejected write creates nothing and never
+    advances the clock watermark.
+    """
+    if not isinstance(payload, dict):
+        raise InvalidRequest("body must be a JSON object")
+    extra = set(payload) - {"capacity", "leak_per_second"}
+    if extra:
+        raise InvalidRequest(f"unknown fields: {sorted(extra)}")
+    capacity, rate = payload.get("capacity"), payload.get("leak_per_second")
+    if not isinstance(capacity, int) or isinstance(capacity, bool) or capacity < 1 or capacity > 1_000_000:
+        raise InvalidRequest("capacity must be an integer between 1 and 1000000")
+    if not isinstance(rate, (int, float)) or isinstance(rate, bool) or rate <= 0 or rate > 1_000_000:
+        raise InvalidRequest("leak_per_second must be a positive number no greater than 1000000")
+    return LeakyConfig(int(capacity), float(rate))
+
+
 def validate_if_match(header: Any) -> int:
     """The sole accepted shape of PUT's optional optimistic-concurrency precondition.
 
@@ -290,6 +330,10 @@ class Limiter:
         # Independent sliding windows, keyed in their own namespace: a window named like a bucket
         # shares neither history nor accounting with it, and window admissions never touch a ledger.
         self._windows: dict[str, SlidingWindow] = {}
+        # Independent leaky buckets, again in their own namespace: a leaky bucket named like a
+        # token bucket or a window shares no level, configuration or accounting with either, and
+        # leaky traffic never writes a ledger event or a decision count.
+        self._leaky: dict[str, LeakyBucket] = {}
         # Highest clock reading ever observed; the effective moment never moves below it.
         self._watermark = float("-inf")
         # Cumulative per-kind decision counters, process-local and born with the Limiter: one
@@ -802,6 +846,79 @@ class Limiter:
             return {"allowed": True, "used": used, "remaining": config.max_events - used,
                     "limit": config.max_events, "window_seconds": config.window_seconds}
 
+    def _leak(self, bucket: LeakyBucket, now: float) -> None:
+        """Drain the bucket at its current leak rate down to a floor of 0.
+
+        Uses the operation's single effective moment, so a stalled clock leaks nothing and a
+        regressed reading (already clamped to the watermark) is treated as "time stayed put" —
+        the regressed interval is never drained twice once the clock recovers. Caller holds the
+        lock.
+        """
+        elapsed = max(0.0, now - bucket.updated_at)
+        bucket.level = max(0.0, bucket.level - elapsed * bucket.config.leak_per_second)
+        bucket.updated_at = now
+
+    def configure_leaky(self, key: Any, payload: Any) -> LeakyConfig:
+        """Create or hot-reconfigure one key's leaky bucket.
+
+        Validation runs before the lock, so a rejected write creates nothing and advances no
+        watermark. A first write starts at level 0. A rewrite first drains the wait since the
+        bucket's last effective moment at the OLD rate (floored at 0), then installs the new
+        configuration and caps the surviving level at the NEW capacity — the new rate governs
+        nothing before this moment.
+        """
+        key = validate_key(key)
+        config = validate_leaky_config(payload)
+        with self._lock:
+            now = self._tick()
+            bucket = self._leaky.get(key)
+            if bucket is None:
+                self._leaky[key] = LeakyBucket(config, 0.0, now)
+            else:
+                self._leak(bucket, now)
+                bucket.config = config
+                bucket.level = min(float(config.capacity), bucket.level)
+            return config
+
+    def leaky_state(self, key: Any) -> dict[str, Any]:
+        """The same {key, level, capacity, leak_per_second} snapshot a check at this moment would see."""
+        key = validate_key(key)
+        with self._lock:
+            now = self._tick()
+            bucket = self._leaky.get(key)
+            if bucket is None:
+                raise LimitNotFound(f"no leaky bucket configured for {key!r}")
+            self._leak(bucket, now)
+            return {"key": key, "level": round(bucket.level, 3),
+                    "capacity": bucket.config.capacity,
+                    "leak_per_second": bucket.config.leak_per_second}
+
+    def leaky_check(self, key: Any, cost: Any) -> dict[str, Any]:
+        """Atomically pour `cost` units into the bucket, counting only what fits.
+
+        The bucket drains at its current rate first (single effective moment, shared lock). If
+        level + cost fits within capacity the pour is counted and the returned level already
+        includes it; otherwise nothing is added and Retry-After is the exact wait for the deficit
+        level + cost - capacity to drain at the current rate. A rejection never raises the level.
+        """
+        key = validate_key(key)
+        cost = validate_cost(cost)
+        with self._lock:
+            now = self._tick()
+            bucket = self._leaky.get(key)
+            if bucket is None:
+                raise LimitNotFound(f"no leaky bucket configured for {key!r}")
+            self._leak(bucket, now)
+            config = bucket.config
+            if bucket.level + cost <= config.capacity:
+                bucket.level += cost
+                return {"allowed": True, "cost": cost, "level": round(bucket.level, 3),
+                        "capacity": config.capacity}
+            retry_after = (bucket.level + cost - config.capacity) / config.leak_per_second
+            raise OverQuota(
+                f"leaky bucket {key!r} holds {bucket.level:.3f}/{config.capacity}, needs {cost}",
+                retry_after)
+
 
 def make_handler(limiter: Limiter) -> type[BaseHTTPRequestHandler]:
     class Handler(BaseHTTPRequestHandler):
@@ -914,6 +1031,12 @@ def make_handler(limiter: Limiter) -> type[BaseHTTPRequestHandler]:
                     return self._send(200, limiter.ledger(parts[2], event_limit))
                 if len(parts) == 3 and parts[:2] == ["v1", "windows"]:
                     return self._send(200, limiter.window_state(parts[2]))
+                if len(parts) == 3 and parts[:2] == ["v1", "leaky-buckets"]:
+                    # Route matched first: like the other no-query routes, any query string is
+                    # invalid_request, decided before the key's 404.
+                    if self._query_string() != "":
+                        raise InvalidRequest("GET /v1/leaky-buckets/{key} takes no query parameters")
+                    return self._send(200, limiter.leaky_state(parts[2]))
                 if parts == ["v1", "metrics"]:
                     # Read-only cumulative counters. The route takes no query parameters at all:
                     # any non-empty query string is invalid_request, decided before the read.
@@ -933,6 +1056,12 @@ def make_handler(limiter: Limiter) -> type[BaseHTTPRequestHandler]:
                     if len(parts) == 3 and parts[:2] == ["v1", "windows"]:
                         window = limiter.configure_window(parts[2], self._read_json())
                         return self._send(200, {"key": parts[2], "window": window.as_json()})
+                    if len(parts) == 3 and parts[:2] == ["v1", "leaky-buckets"]:
+                        if self._query_string() != "":
+                            raise InvalidRequest(
+                                "PUT /v1/leaky-buckets/{key} takes no query parameters")
+                        config = limiter.configure_leaky(parts[2], self._read_json())
+                        return self._send(200, {"key": parts[2], "leaky_bucket": config.as_json()})
                     return self._send(404, {"error": {"code": "not_found"}})
                 # The precondition belongs to this one route: header and body are both validated
                 # before the lock (a repeated If-Match line is a list of tags and is never the one
@@ -1003,6 +1132,15 @@ def make_handler(limiter: Limiter) -> type[BaseHTTPRequestHandler]:
                     if not isinstance(body, dict) or body:
                         raise InvalidRequest('body must be an empty JSON object {}')
                     result = limiter.window_check(parts[2])
+                    return self._send(200, result)
+                if len(parts) == 4 and parts[:2] == ["v1", "leaky-buckets"] and parts[3] == "check":
+                    if self._query_string() != "":
+                        raise InvalidRequest(
+                            "POST /v1/leaky-buckets/{key}/check takes no query parameters")
+                    body = self._read_json()
+                    if not isinstance(body, dict) or set(body) - {"cost"}:
+                        raise InvalidRequest('body must be {} or {"cost": <integer 1..1000000>}')
+                    result = limiter.leaky_check(parts[2], body.get("cost", 1))
                     return self._send(200, result)
                 return self._send(404, {"error": {"code": "not_found"}})
             except OverQuota as error:

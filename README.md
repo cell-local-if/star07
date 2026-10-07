@@ -192,13 +192,51 @@ PYTHONPATH=src python3 -m unittest discover -s tests -v
 - 一次成功决策计一次 `allowed`；一次因额度或窗口不足返回 `429` 的决策计一次 `over_quota`。
   层级请求**按整个请求计一次**，不按层数累计。
 - 预留的 consume、rollback、过期结算与所有 GET 读取**不计数**；参数校验失败（`400`）、
-  未配置 key 的 `404`、未知路由与错误方法也**不计数**。
+  未配置 key 的 `404`、未知路由与错误方法也**不计数**。漏桶的 PUT/check/GET 同样**不计数**，
+  五类形状不因漏桶流量改变。
 - 计数在同一把锁内随决策精确加一：并发下不丢失、不重复。
 - 读取**只加锁拷贝计数**：不采样时钟、不推进高水位线、不结算预留、不补充令牌、不改账本或窗口历史，
   时钟停住或回拨不会改变读取结果。
 - 计数只存进程内存并随 Limiter 累计，重启归零，无持久化承诺。
 - 本路由**不带查询参数**：带任意查询参数 ⇒ `400 invalid_request`；路径多段、少段或方法不是 GET
   ⇒ `404 not_found`，且错误路径与错误方法不读取请求体。
+
+### `PUT /v1/leaky-buckets/{key}`
+与令牌桶、滑动窗口**彼此独立**的漏桶：创建或热更新一个漏桶。请求体只接受
+`{"capacity": <int 1..1000000>, "leak_per_second": <number > 0 且 ≤ 1000000>}`（`capacity` 须为非布尔整数，
+`leak_per_second` 须为非布尔数字，两者均不允许缺省或未知字段）。
+- 成功：`200 {"key": ..., "leaky_bucket": {"capacity": <int>, "leak_per_second": <number>}}`。
+- **首次创建 level 为 0**。再次 PUT（热更新）：先按**旧** `leak_per_second` 扣除上一有效时刻到本次
+  有效时刻之间的漏出（以 0 为下限），再装入新配置并以**新** `capacity` 封顶现存水位
+  （`min(旧速率漏出后的 level, 新 capacity)`）；新速率**不追溯**作用于重配前的等待。
+- 非法 JSON、未知字段、非法 key（与令牌桶同一 key 规则）或非法参数 ⇒ `400 invalid_request`，
+  且**不创建、不推进时钟水位线**（校验在进入锁之前完成）。
+
+### `POST /v1/leaky-buckets/{key}/check`
+请求体只接受空 JSON 对象 `{}` 或仅含 `cost` 的对象：`{"cost": <int 1..1000000，缺省 1>}`
+（非布尔整数；非对象、未知字段、非法 `cost`、畸形 JSON 或缺 `Content-Length` ⇒ `400 invalid_request`）。
+- 与既有额度操作**共用同一临界区与同一次时钟采样**（高水位线口径）：先按当前 `leak_per_second`
+  漏出，再判断 `level + cost` 是否不超过 `capacity`。
+- 放得下：`200 {"allowed": true, "cost": <int 本次值>, "level": <float 计入后占用量，保留三位小数>, "capacity": <int>}`，
+  本次 `cost` 计入水位。
+- 放不下：**不计入**本次 `cost`（level 不变），返回 **`429`** `{"error":{"code":"over_quota",...}}`
+  并带 **`Retry-After`**——补足 `level + cost - capacity` 缺口按当前漏速所需秒数，与令牌桶同一口径：
+  按毫秒**向上取整**、保留三位小数（亚毫秒也给 `0.001`）。
+- 未知漏桶 ⇒ `404 not_found`；路径段数不对、末段不是 `check` 或方法不匹配 ⇒ **先**返回 `404 not_found`
+  且不读请求体。
+
+### `GET /v1/leaky-buckets/{key}`
+返回 check 同一有效时刻下的同一口径快照：`200 {"key": ..., "level": <float 保留三位小数>, "capacity": <int>, "leak_per_second": <number>}`
+（先按当前漏速漏出再读数；未知漏桶 ⇒ `404 not_found`；不带 ETag）。
+
+#### 漏桶的时间语义、并发与隔离
+- 有效时刻沿用**单调时钟高水位线**口径，与令牌桶、窗口共用同一把锁、同一次 `_tick`：时钟停住不漏出；
+  读数回拨视为停留在水位线（水位不下降）；恢复后回拨区间不会被重复计入漏出。
+- 并发 check 与热更新在同一把锁下串行：串行后 `level` 恒不超过 `capacity`，被拒绝的请求不增加 `level`。
+- 漏桶只存进程内存，与同名令牌桶、同名窗口**相互隔离**：`PUT /v1/leaky-buckets/k` 不创建
+  `/v1/limits/k` 或 `/v1/windows/k`，反之亦然。漏桶**不写账本**、不影响 `used`、不参与 revision/ETag，
+  也**不加入** `/v1/metrics` 的五类决策计数；既有接口的 JSON 形状、`Retry-After`、计数与时钟行为完全不变。
+- 三个漏桶路由均**不带查询参数**：带任意查询参数 ⇒ `400 invalid_request`（先于 key 的 404）。
 
 #### 滑动窗口的时间语义（确定性）
 - 有效时刻沿用令牌桶的**单调时钟高水位线**口径，与令牌桶共用同一把锁、同一次 `_tick`：每个公开操作
@@ -237,5 +275,5 @@ PYTHONPATH=src python3 -m unittest discover -s tests -v
 
 ## 未实现（后续任务候选，非固定题单）
 
-漏桶、跨实例一致、热点键、降级与熔断、
+跨实例一致、热点键、降级与熔断、
 可观测性与压测基线。
