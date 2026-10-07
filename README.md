@@ -52,6 +52,11 @@ PYTHONPATH=src python3 -m unittest discover -s tests -v
 - 允许：`200 {"allowed": true, "remaining": <int 向下取整>, "capacity": <int>}`（并扣减令牌）。
 - 超限：**`429`** `{"error":{"code":"over_quota",...}}`，并带 **`Retry-After`**（秒，浮点；按当前 `refill_per_second` 计算并向上取整到毫秒，至少足够补足本次 `cost`，与 `POST /v1/reservations` 同一口径）。
 - 未配置的 key ⇒ `404 not_found`；`cost` 非法（含布尔值）⇒ `400 invalid_request`。
+- 已配置 key 的合法 `cost` **大于当前 `capacity`** 时永远不可能入桶 ⇒ `400 invalid_request`
+  （`message` 说明 cost 超过 capacity），不返回 200/429 也不带 `Retry-After`；该判断与并发 PUT
+  在同一临界区内完成（每个请求只见更新前或更新后的单一配置），且在采样时钟之前返回——不推进
+  水位线、不结算预留、不补令牌、不扣减、不落账、不计入 check 指标。`cost` 等于 `capacity` 仍按
+  正常口径判断。
 
 ### `POST /v1/hierarchies/check`
 面向**组织到租户**的层级即时扣减：复用 `PUT /v1/limits/{key}` 配置的既有令牌桶，不另建配置协议。

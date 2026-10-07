@@ -511,6 +511,18 @@ class Limiter:
         key = validate_key(key)
         cost = validate_cost(cost)
         with self._lock:
+            # A legal cost that exceeds the key's CURRENT capacity can never be admitted, however
+            # long the caller waits: reject it as invalid_request instead of hinting a finite
+            # Retry-After for an unsatisfiable request. The comparison reads the same locked
+            # configuration a concurrent PUT installs, so each request sees exactly one capacity —
+            # before or after the reconfigure, never a torn intermediate. This branch runs before
+            # the clock is sampled: no watermark advance, no expiry settle, no refill, no ledger
+            # event, no decision count. An unconfigured key has no capacity to compare against,
+            # so it keeps the baseline 404 (clock sampled exactly as before).
+            limit = self._limits.get(key)
+            if limit is not None and cost > limit.capacity:
+                raise InvalidRequest(
+                    f"cost {cost} exceeds capacity {limit.capacity} for key {key!r}")
             now = self._tick()
             limit = self.limit(key)
             self._expire_due(key, now)
