@@ -542,21 +542,36 @@ class Limiter:
         """Atomically deduct `cost` from every layer of an ordered parent-to-leaf hierarchy.
 
         Same critical section, same single effective moment as check(): validation happens before
-        the lock, then every layer's due reservations are settled and its bucket refilled at this
-        one moment, and only then is affordability judged. The decision is all-or-nothing — either
-        every layer can pay and all are deducted and booked together, or none is touched (beyond
-        the lazy expiry settle every entry point performs) and the rejection hints the longest
-        wait any insufficient layer needs to cover its own deficit.
+        the lock, and — before the clock is sampled — every layer is confirmed configured (the 404
+        names the first unconfigured key) and a legal cost above any layer's CURRENT capacity is
+        rejected as invalid_request (naming the first layer whose capacity the cost exceeds): such
+        a request is unsatisfiable on that layer however long the caller waits, so it never
+        advances the watermark, settles a hold, refills, deducts, books or counts a decision.
+        Only afterwards is the single effective moment taken, every layer's due reservations are
+        settled and its bucket refilled at this one moment, and only then is affordability judged.
+        The decision is all-or-nothing — either every layer can pay and all are deducted and
+        booked together, or none is touched (beyond the lazy expiry settle every entry point
+        performs) and the rejection hints the longest wait any insufficient layer needs to cover
+        its own deficit.
         """
         keys = validate_keys(keys)
         cost = validate_cost(cost)
         with self._lock:
-            now = self._tick()
-            # Configuration is validated for every layer, in input order, before any settle or
-            # deduction: the 404 names the first unconfigured key and no layer's state changes.
+            # Configuration is confirmed for every layer, in input order, before the clock is
+            # sampled or any layer's state changes: the 404 names the first unconfigured key.
             for key in keys:
                 if key not in self._limits:
                     raise LimitNotFound(f"no limit configured for {key!r}")
+            # All layers exist; only now is the capacity boundary judged. A legal cost above a
+            # layer's current capacity can never be admitted by that layer, so the 400 names the
+            # first such layer in input order (and its capacity) — still before the tick, so the
+            # watermark, holds, buckets, ledgers and decision counters are all untouched.
+            for key in keys:
+                capacity = self._limits[key].capacity
+                if cost > capacity:
+                    raise InvalidRequest(
+                        f"cost {cost} exceeds capacity {capacity} for hierarchy layer {key!r}")
+            now = self._tick()
             buckets = []
             for key in keys:
                 self._expire_due(key, now)
@@ -586,11 +601,15 @@ class Limiter:
         """Atomically hold `cost` tokens on every layer of a hierarchy, without booking them as used.
 
         Same critical section, same single effective moment and same all-or-nothing judgement as
-        hierarchy_check: validation happens before the lock, configuration is confirmed for every
-        layer in input order (the 404 names the first unconfigured key), then each layer's due
-        holds — single-key and cross-layer alike — are settled and its bucket refilled at this one
-        moment. Either every layer can pay and all are deducted together, or none is touched and
-        the rejection hints the longest wait any insufficient layer needs to cover its own deficit.
+        hierarchy_check: validation happens before the lock, and — before the clock is sampled —
+        configuration is confirmed for every layer in input order (the 404 names the first
+        unconfigured key) and a legal cost above any layer's current capacity is rejected as
+        invalid_request (naming the first layer whose capacity the cost exceeds): unsatisfiable on
+        that layer forever, it settles no hold, refills nothing, deducts nothing, creates no hold
+        and counts no decision. Only afterwards is the one moment taken and each layer's due holds
+        — single-key and cross-layer alike — settled and its bucket refilled at this one moment.
+        Either every layer can pay and all are deducted together, or none is touched and the
+        rejection hints the longest wait any insufficient layer needs to cover its own deficit.
         The hold books no used and no ledger event; that happens only at consume time. It lapses
         `ttl_seconds` of monotonic time after creation; reconfiguring a layer never extends it.
         """
@@ -598,10 +617,17 @@ class Limiter:
         cost = validate_cost(cost)
         ttl_seconds = validate_ttl(ttl_seconds)
         with self._lock:
-            now = self._tick()
+            # Configuration confirmed for every layer in input order before the clock is sampled.
             for key in keys:
                 if key not in self._limits:
                     raise LimitNotFound(f"no limit configured for {key!r}")
+            # Then the capacity boundary, first offending layer in input order, still pre-tick.
+            for key in keys:
+                capacity = self._limits[key].capacity
+                if cost > capacity:
+                    raise InvalidRequest(
+                        f"cost {cost} exceeds capacity {capacity} for hierarchy layer {key!r}")
+            now = self._tick()
             buckets = []
             for key in keys:
                 self._expire_due(key, now)
@@ -628,13 +654,25 @@ class Limiter:
     def reserve(self, key: Any, cost: Any, ttl_seconds: Any = DEFAULT_TTL_SECONDS) -> dict[str, Any]:
         """Atomically hold `cost` tokens, exactly as check() judges them, without booking them as used.
 
-        The hold lapses `ttl_seconds` of monotonic time after creation; reconfiguring the key never
-        extends it. Expired holds are settled lazily at the start of this call (see _expire_due).
+        A legal cost above the key's CURRENT capacity is unsatisfiable forever, so — exactly as in
+        check() — it is invalid_request inside the lock before the clock is sampled: no watermark
+        advance, no expiry settle, no refill, no hold, no deduction and no decision count; an
+        unconfigured key keeps the baseline 404 (clock sampled exactly as before). The hold lapses
+        `ttl_seconds` of monotonic time after creation; reconfiguring the key never extends it.
+        Expired holds are settled lazily at the start of this call (see _expire_due).
         """
         validate_key(key)
         cost = validate_cost(cost)
         ttl_seconds = validate_ttl(ttl_seconds)
         with self._lock:
+            # Same pre-tick capacity boundary as check(): the locked configuration a concurrent PUT
+            # installs is the one compared, so each request sees exactly one capacity, and the
+            # rejection predates every state change. An absent key falls through to limit() below,
+            # whose 404 samples the clock as it always did.
+            limit = self._limits.get(key)
+            if limit is not None and cost > limit.capacity:
+                raise InvalidRequest(
+                    f"cost {cost} exceeds capacity {limit.capacity} for key {key!r}")
             now = self._tick()
             limit = self.limit(key)
             self._expire_due(key, now)

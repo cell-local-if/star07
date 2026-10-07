@@ -97,8 +97,10 @@ class HierarchyUnitTests(unittest.TestCase):
     def test_stalled_and_regressed_clock_follow_the_watermark(self) -> None:
         self.limiter.hierarchy_check(["global", "tenant-a"], 2)  # global 8, tenant-a 2
         self.clock.t -= 500.0  # regression: no refill is conjured
+        # Cost 3 fits both capacities (10 and 4) but exceeds tenant-a's 2 live tokens: a genuine
+        # temporary shortfall (never the cost>capacity 400), still 429 under the pinned clock.
         with self.assertRaises(OverQuota):
-            self.limiter.hierarchy_check(["global", "tenant-a"], 9)
+            self.limiter.hierarchy_check(["global", "tenant-a"], 3)
         self.clock.t += 500.0  # recovery: the regressed interval is not counted twice
         result = self.limiter.hierarchy_check(["global", "tenant-a"], 2)
         self.assertTrue(result["allowed"])

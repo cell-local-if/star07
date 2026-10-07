@@ -209,16 +209,34 @@ class CostExceedsCapacityHttpTests(unittest.TestCase):
         _, after, _ = self.request("GET", "/v1/metrics")
         self.assertEqual(after, before)
 
-    def test_other_entry_points_are_unaffected(self) -> None:
-        # The same oversized cost through reservations keeps the baseline 429 + Retry-After.
+    def test_other_entry_points_share_the_same_capacity_boundary(self) -> None:
+        # The same oversized cost through reservations is now invalid_request, never 429,
+        # and carries no Retry-After — a hold above capacity is unsatisfiable like a check.
         self.request("PUT", "/v1/limits/xc-3", {"capacity": 2, "refill_per_second": 1})
         status, body, headers = self.request("POST", "/v1/reservations", {"key": "xc-3", "cost": 3})
-        self.assertEqual((status, body["error"]["code"]), (429, "over_quota"))
-        self.assertIn("Retry-After", headers)
-        # And a same-cost hierarchy check keeps its own semantics too.
+        self.assertEqual((status, body["error"]["code"]), (400, "invalid_request"))
+        self.assertIn("exceeds capacity 2", body["error"]["message"])
+        self.assertNotIn("Retry-After", headers)
+        # And a same-cost hierarchy check is invalid_request too, naming the first short layer.
         self.request("PUT", "/v1/limits/xc-4", {"capacity": 2, "refill_per_second": 1})
+        status, body, headers = self.request("POST", "/v1/hierarchies/check",
+                                             {"keys": ["xc-3", "xc-4"], "cost": 3})
+        self.assertEqual((status, body["error"]["code"]), (400, "invalid_request"))
+        self.assertIn("xc-3", body["error"]["message"])
+        self.assertNotIn("Retry-After", headers)
+
+    def test_temporarily_short_but_satisfiable_requests_still_get_429(self) -> None:
+        # Cost AT or below capacity but above the current tokens keeps the baseline 429 with a
+        # Retry-After hint on every entry point: only a cost above capacity became invalid_request.
+        self.request("PUT", "/v1/limits/xc-5", {"capacity": 2, "refill_per_second": 1})
+        self.request("POST", "/v1/check", {"key": "xc-5", "cost": 2})   # bucket empty
+        status, _, headers = self.request("POST", "/v1/reservations", {"key": "xc-5", "cost": 2})
+        self.assertEqual(status, 429)
+        self.assertIn("Retry-After", headers)
+        self.request("PUT", "/v1/limits/xc-6", {"capacity": 2, "refill_per_second": 1})
+        self.request("POST", "/v1/check", {"key": "xc-6", "cost": 2})
         status, _, headers = self.request("POST", "/v1/hierarchies/check",
-                                          {"keys": ["xc-3", "xc-4"], "cost": 3})
+                                          {"keys": ["xc-5", "xc-6"], "cost": 2})
         self.assertEqual(status, 429)
         self.assertIn("Retry-After", headers)
 

@@ -63,15 +63,24 @@ PYTHONPATH=src python3 -m unittest discover -s tests -v
 请求体：`{"keys": [<string>, ...], "cost": <int 1..1000000，缺省 1>}`。
 - `keys` 为 **2..20 个互不重复**的非空字符串（每个均须通过既有 key 规则），按输入顺序表示上级到末级；
   `cost` 规则与 `POST /v1/check` 相同（非布尔整数，缺省 1）。
-- 与既有额度操作**共用同一临界区、同一次时钟采样**：先按既有规则对每层结算到期预留并补充令牌，
-  再同时判断每层是否足以承担本次 `cost`。
+- 与既有额度操作**共用同一临界区、同一次时钟采样**：进入锁后先按输入顺序确认每层都已配置
+  （任一层缺失即 `404 not_found`，`message` 指明第一个未配置的 key），再确认合法 `cost` 不大于
+  任一层的当前 `capacity`；然后才采样时钟，对每层结算到期预留并补充令牌，最后同时判断每层是否
+  足以承担本次 `cost`。
 - 全部足够：`200 {"allowed": true, "cost": <int>, "layers": [{"key": ..., "remaining": <int 向下取整>, "capacity": <int>}, ...]}`，
   `layers` 按 `keys` 输入顺序，`remaining` 为扣减后的值；每层账本追加一条 `source` 为 `"hierarchy_check"`、
   `reservation_id` 为 `null` 的事件（`effective_at` 等字段同即时消耗口径），`used` 按 `cost` 增加。
 - 任一层不足：**整体拒绝**，各层不扣减、不落账 ⇒ `429 over_quota`；`Retry-After` 取所有不足层
   各自按补充速率补齐 deficit 所需时间的**最大值**，沿用毫秒向上取整格式。
-- 体含未知或缺失字段、`keys`/`cost` 非法、层重复 ⇒ `400 invalid_request`；结构合法但含未配置层
-  ⇒ `404 not_found`，`message` 指明输入顺序中第一个未配置的 key（`invalid_request` 先于 `not_found`）。
+- 已确认全部层存在后，只要任一层的当前 `capacity` **小于**合法 `cost`，该请求在该层永远无法满足
+  ⇒ `400 invalid_request`（`message` 指出输入顺序中第一个容量小于 `cost` 的 key 及其 capacity），
+  不返回 200/429 也不带 `Retry-After`；该判断与并发 PUT 在同一临界区内完成（每个请求只见更新前或
+  更新后的单一配置，不能混合两个版本），且在**采样时钟之前**返回——不推进水位线、不结算到期预留、
+  不补令牌、不扣减任何层、不写 `used` 或账本、不计入 hierarchy_check 指标、不改变 revision 或 ETag。
+  `cost` 等于任一层 `capacity` 仍是合法请求，随后继续走原有可用性判断（仍可能因令牌暂时不足而 429）。
+- 体含未知或缺失字段、`keys`/`cost` 非法、层重复 ⇒ `400 invalid_request`（锁前格式校验，先于
+  key 的 404）；结构合法但含未配置层 ⇒ `404 not_found`，`message` 指明输入顺序中第一个未配置的
+  key（锁内先确认全部层存在，故 404 先于容量越界的 `400 invalid_request`）。
 - 并发下**只能全成或全败**：不出现部分扣减或部分落账；失败除既有惰性过期结算外不改变 `used`；
   时钟停住与回拨仍遵循高水位线口径。
 
@@ -86,7 +95,13 @@ PYTHONPATH=src python3 -m unittest discover -s tests -v
 - 与 `check` 共用同一把锁、同一套原子额度判断：并发的检查、预留、到期释放与回滚不会超卖，也不会双重返还。
 - 未配置的 key ⇒ `404 not_found`；key/cost/`ttl_seconds` 非法（含布尔值；`ttl_seconds` 须为 1..86400 的整数）⇒ `400 invalid_request`，
   且不创建预留、不扣减令牌。
-- 令牌不足 ⇒ `429 over_quota` 并带 **`Retry-After`**（秒，浮点；按当前 `refill_per_second` 计算并向上取整到毫秒，至少足够补足本次 `cost`）。
+- 已配置 key 的合法 `cost` **大于当前 `capacity`** 时该预留永远不可能成立 ⇒ `400 invalid_request`
+  （`message` 说明 cost 超过 capacity），不返回 200/429 也不带 `Retry-After`；判断口径与 `POST /v1/check`
+  完全一致——与并发 PUT 在同一临界区内完成（每个请求只见更新前或更新后的单一配置），且在采样时钟之前
+  返回，不推进水位线、不结算到期预留、不补令牌、不扣减、不创建预留、不写账本、不计入 reservation 指标、
+  不改变 revision 或 ETag；未配置 key 仍为 `404 not_found`。`cost` 等于 `capacity` 仍为合法请求，
+  随后继续走原有可用性判断（仍可能因令牌暂时不足而 429）。
+- 令牌不足（合法 `cost` 不大于当前 `capacity` 但多于当前令牌）⇒ `429 over_quota` 并带 **`Retry-After`**（秒，浮点；按当前 `refill_per_second` 计算并向上取整到毫秒，至少足够补足本次 `cost`）。
 
 ### `DELETE /v1/reservations/{reservation_id}`
 对**尚未过期且未回滚**的预留执行**一次**撤销：把预留扣掉的 `cost` 放回该 key 当前桶，并按当前 `capacity` 封顶（返还前也先按时间补充）。
@@ -118,11 +133,20 @@ PYTHONPATH=src python3 -m unittest discover -s tests -v
 `keys`/`cost`/`ttl_seconds` 规则分别与 `hierarchies/check` 和单键预留相同。
 - 成功：`200 {"reservation_id": ..., "keys": [...], "cost": <int>, "ttl_seconds": <int>, "layers": [{"key": ..., "remaining": <int>, "capacity": <int>}, ...]}`，
   `layers` 按 `keys` 输入顺序；每层立即扣 `cost`（`remaining` 立即反映）但 **`used` 不变、账本不写**。
-- 与单键预留、层级扣减**共用同一临界区与同一次时钟采样**：先按输入顺序确认每层均已配置
-  （否则 `404 not_found`，`message` 指明第一个未配置的 key），再对每层结算到期的单层与跨层预留并补充令牌，
-  最后同时判断。任一层不足 ⇒ 整体 `429 over_quota`，各层不扣减、不落账；`Retry-After` 取所有不足层
-  各自 deficit 补齐时间的**最大值**，毫秒向上取整三位小数。
-- 非法输入（缺 `keys`、未知字段、`keys`/`cost`/`ttl_seconds` 非法）⇒ `400 invalid_request`，不创建预留、不扣减。
+- 与单键预留、层级扣减**共用同一临界区与同一次时钟采样**：进入锁后先按输入顺序确认每层均已配置
+  （否则 `404 not_found`，`message` 指明第一个未配置的 key），再确认合法 `cost` 不大于任一层的当前
+  `capacity`，然后才采样时钟、对每层结算到期的单层与跨层预留并补充令牌，最后同时判断。任一层不足
+  （合法 `cost` 不大于各层 `capacity` 但多于其当前令牌）⇒ 整体 `429 over_quota`，各层不扣减、不落账；
+  `Retry-After` 取所有不足层各自 deficit 补齐时间的**最大值**，毫秒向上取整三位小数。
+- 已确认全部层存在后，只要任一层的当前 `capacity` **小于**合法 `cost`，该跨层预留永远不可能成立
+  ⇒ `400 invalid_request`（`message` 指出输入顺序中第一个容量小于 `cost` 的 key 及其 capacity），
+  不返回 200/429 也不带 `Retry-After`；与并发 PUT 在同一临界区内完成（每个请求只见更新前或更新后的
+  单一配置，不能混合两个版本），且在**采样时钟之前**返回——不推进水位线、不结算到期预留、不补令牌、
+  不扣减任何层、不写 `used` 或账本、不创建预留、不计入 hierarchy_reservation 指标、不改变 revision 或
+  ETag。`cost` 等于任一层 `capacity` 仍为合法请求，随后继续走原有可用性判断。
+- 非法输入（缺 `keys`、未知字段、`keys`/`cost`/`ttl_seconds` 非法）⇒ `400 invalid_request`（锁前格式校验，
+  先于 key 的 404），不创建预留、不扣减；结构合法但含未配置层 ⇒ `404 not_found`（404 先于容量越界的
+  `400 invalid_request`）。
 - 跨层预留按创建时刻 `+ ttl_seconds` **惰性过期**（边界取大于等于）；任何额度入口开始时一并结算到期的
   单层与跨层预留，一个跨层预留过期时其**所有层在同一临界区内各返还一次**并按各自当前 `capacity` 封顶；
   重配任一层不延长 TTL。
@@ -197,7 +221,7 @@ PYTHONPATH=src python3 -m unittest discover -s tests -v
 - 一次成功决策计一次 `allowed`；一次因额度或窗口不足返回 `429` 的决策计一次 `over_quota`。
   层级请求**按整个请求计一次**，不按层数累计。
 - 预留的 consume、rollback、过期结算与所有 GET 读取**不计数**；参数校验失败（`400`）、
-  未配置 key 的 `404`、未知路由与错误方法也**不计数**。
+  合法 cost 超过当前 capacity 的永不满足 `400 invalid_request`、未配置 key 的 `404`、未知路由与错误方法也**不计数**。
 - 计数在同一把锁内随决策精确加一：并发下不丢失、不重复。
 - 读取**只加锁拷贝计数**：不采样时钟、不推进高水位线、不结算预留、不补充令牌、不改账本或窗口历史，
   时钟停住或回拨不会改变读取结果。
