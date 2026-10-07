@@ -209,18 +209,28 @@ class CostExceedsCapacityHttpTests(unittest.TestCase):
         _, after, _ = self.request("GET", "/v1/metrics")
         self.assertEqual(after, before)
 
-    def test_other_entry_points_are_unaffected(self) -> None:
-        # The same oversized cost through reservations keeps the baseline 429 + Retry-After.
+    def test_same_boundary_holds_on_the_other_public_entries(self) -> None:
+        # The same oversized cost through a single-key reservation is now invalid_request
+        # with no Retry-After, consistent with POST /v1/check.
         self.request("PUT", "/v1/limits/xc-3", {"capacity": 2, "refill_per_second": 1})
         status, body, headers = self.request("POST", "/v1/reservations", {"key": "xc-3", "cost": 3})
-        self.assertEqual((status, body["error"]["code"]), (429, "over_quota"))
-        self.assertIn("Retry-After", headers)
-        # And a same-cost hierarchy check keeps its own semantics too.
+        self.assertEqual((status, body["error"]["code"]), (400, "invalid_request"))
+        self.assertIn("exceeds capacity 2", body["error"]["message"])
+        self.assertNotIn("Retry-After", headers)
+        # And the hierarchy check rejects identically: cost above any layer's capacity is
+        # unsatisfiable on that layer, so it is 400 naming the offending layer, never 429.
         self.request("PUT", "/v1/limits/xc-4", {"capacity": 2, "refill_per_second": 1})
-        status, _, headers = self.request("POST", "/v1/hierarchies/check",
-                                          {"keys": ["xc-3", "xc-4"], "cost": 3})
-        self.assertEqual(status, 429)
-        self.assertIn("Retry-After", headers)
+        status, body, headers = self.request("POST", "/v1/hierarchies/check",
+                                             {"keys": ["xc-3", "xc-4"], "cost": 3})
+        self.assertEqual((status, body["error"]["code"]), (400, "invalid_request"))
+        self.assertIn("exceeds capacity 2", body["error"]["message"])
+        self.assertNotIn("Retry-After", headers)
+        # The cross-layer reservation entry shares the same boundary.
+        status, body, headers = self.request("POST", "/v1/hierarchies/reservations",
+                                             {"keys": ["xc-3", "xc-4"], "cost": 3})
+        self.assertEqual((status, body["error"]["code"]), (400, "invalid_request"))
+        self.assertIn("exceeds capacity 2", body["error"]["message"])
+        self.assertNotIn("Retry-After", headers)
 
 
 if __name__ == "__main__":
