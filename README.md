@@ -190,6 +190,20 @@ PYTHONPATH=src python3 -m unittest discover -s tests -v
 - 未配置的 key ⇒ `404 not_found`；`events` 不是 1..1000 内的整数字面量、参数重复或出现任何未知查询参数
   ⇒ `400 invalid_request`（查询校验先于 key 的 404）；路径段数不对或方法不匹配 ⇒ `404 not_found`。
 
+### `GET /v1/reconciliations/{key}`
+**对账入口**：在一次加锁快照内把令牌桶状态与账本合计对齐到同一有效时刻，供计费对账。
+- 成功：`200 {"key": ..., "remaining": <int>, "used": <int>, "accepted_count": <int>, "accepted_cost": <int>, "balanced": <bool>}`。
+  进入同一临界区后只采样一次时钟，按高水位线规则补足令牌并结算到期预留（与 `GET /v1/limits/{key}` 同一口径）：
+  `remaining`/`used` 与同刻 `GET /v1/limits/{key}` 一致，`accepted_count`/`accepted_cost` 与
+  `GET /v1/ledgers/{key}` 的 `totals` 一致；`used` 等于 `accepted_cost` 时 `balanced` 为 `true`，否则为 `false`。
+- 查询**只读对账，不落账**：不追加账本事件、不推进 revision、不改变 ETag、不增加决策计数、不重复结算预留；
+  与并发 check、层级 check、consume、回滚、配置更新共用同一把锁，快照内部恒一致。
+  时钟停住时结果稳定；读数回拨按水位线语义处理，时钟恢复后回拨区间不被重复计入。
+- 成功响应**不带 ETag**，也不引入 `If-Match`、`Idempotency-Key` 或 `Retry-After` 语义。
+- 本路由**不带查询参数**：携带任意查询参数 ⇒ `400 invalid_request`（裸 `?` 视为空查询，与 `/v1/metrics` 同口径）；
+  key 格式非法（与令牌桶同一 key 规则）⇒ `400 invalid_request`；key 合法但未配置 ⇒ `404 not_found`；
+  路径含空段、段数不对或方法不是 GET ⇒ `404 not_found`。错误仍为 `{"error":{"code":...,"message":...}}` 结构。
+
 ### `PUT /v1/windows/{key}`
 与令牌桶**彼此独立**的精确滑动窗口限流：创建或更新窗口。请求体只接受
 `{"window_seconds": <int 1..3600>, "max_events": <int 1..1000000>}`（两者均须为非布尔整数，不允许缺省、
@@ -310,7 +324,7 @@ PYTHONPATH=src python3 -m unittest discover -s tests -v
   状态在同一临界区取出。并发的两个同版本条件 PUT 中恰好一个成功（200，revision+1），另一个 409；后续若用
   新 ETag 重试即可成功。
 - 除新增 ETag 响应头与可选 `If-Match` 及其 `409`、`POST /v1/reservations` 可选 `Idempotency-Key` 及其
-  `409 idempotency_conflict` 外，不带这些头的 PUT、GET、check、hierarchies、
+  `409 idempotency_conflict`、`GET /v1/reconciliations/{key}` 对账入口外，不带这些头的 PUT、GET、check、hierarchies、
   reservations、ledgers、windows、leaky-buckets、metrics 的 JSON 形状、状态推进、错误分类与并发保证均不变。
   `Idempotency-Key` 不写账本、不新增 metrics 分类，绑定只存进程内存（重启清空、不跨实例），且不作用于层级预留等其他路由。
 

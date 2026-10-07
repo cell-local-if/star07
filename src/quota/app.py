@@ -920,6 +920,33 @@ class Limiter:
                 "events": [event.as_json() for event in events[-event_limit:]],
             }
 
+    def reconciliation(self, key: Any) -> dict[str, Any]:
+        """One locked reconciliation snapshot for a key: bucket state joined with ledger totals.
+
+        The key is validated before the lock, so a malformed key neither samples the clock nor
+        advances the watermark. Inside the single critical section the clock is sampled once and
+        the key's due reservations are settled and its bucket refilled at this one effective
+        moment — the same watermark rule every quota entry point follows — so `remaining` and
+        `used` are exactly what GET /v1/limits/{key} reports at this moment, while
+        `accepted_count`/`accepted_cost` are the full-history ledger totals GET /v1/ledgers/{key}
+        reports. `balanced` is true exactly when `used` equals `accepted_cost`. The read books
+        nothing: no ledger event, no revision or ETag change, no decision count, and the lazy
+        expiry settle refunds each due reservation at most once, so a stalled or regressed clock
+        keeps the result stable and a recovered clock never recounts the regressed interval.
+        """
+        key = validate_key(key)
+        with self._lock:
+            now = self._tick()
+            self.limit(key)  # 404 for an unconfigured key, after the baseline clock sample
+            self._expire_due(key, now)
+            bucket = self._refill(key, now)
+            used = sum(bucket.cost_history)
+            events = self._ledgers.get(key, [])
+            accepted_cost = sum(event.cost for event in events)
+            return {"key": key, "remaining": int(bucket.tokens), "used": used,
+                    "accepted_count": len(events), "accepted_cost": accepted_cost,
+                    "balanced": used == accepted_cost}
+
     def _expire_window(self, window: SlidingWindow, now: float) -> None:
         """Drop every window event whose age has reached window_seconds at this effective moment.
 
@@ -1197,6 +1224,15 @@ def make_handler(limiter: Limiter) -> type[BaseHTTPRequestHandler]:
                     # validation precedes quota classification everywhere else.
                     event_limit = self._ledger_event_limit()
                     return self._send(200, limiter.ledger(parts[2], event_limit))
+                if len(parts) == 3 and parts[:2] == ["v1", "reconciliations"]:
+                    # Like /v1/metrics this route names no query parameters: any query string is
+                    # invalid_request, decided before the limiter call (and hence before the
+                    # clock is sampled or the watermark advances). The success body carries no
+                    # ETag: a reconciliation reads state but names no configuration revision.
+                    if self._query_string() != "":
+                        raise InvalidRequest(
+                            "GET /v1/reconciliations/{key} takes no query parameters")
+                    return self._send(200, limiter.reconciliation(parts[2]))
                 if len(parts) == 3 and parts[:2] == ["v1", "windows"]:
                     return self._send(200, limiter.window_state(parts[2]))
                 if len(parts) == 3 and parts[:2] == ["v1", "leaky-buckets"]:
