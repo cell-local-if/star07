@@ -29,6 +29,18 @@ PYTHONPATH=src python3 -m unittest discover -s tests -v
 
 ### `PUT /v1/limits/{key}`
 请求体：`{"capacity": <int 1..1000000>, "refill_per_second": <number > 0>}` → `200 {"key": ..., "limit": {...}}`
+- **配置版本 revision 与 ETag**：每个 key 第一次成功创建时 revision 为 **1**，此后每次成功 PUT 都 **+1**
+  （即使新旧配置完全相同也递增）。成功 PUT 与 `GET /v1/limits/{key}` 的响应都带头
+  **`ETag: "<revision>"`**（双引号包裹的当前 revision 十进制字符串，如 `ETag: "3"`）。响应 JSON 的字段与
+  取值口径不变；ETag **只**反映配置 revision，不代表 token、`used`、账本或窗口版本。
+- **乐观并发控制（可选 `If-Match`）**：请求可带头 `If-Match: "<revision>"`。该头**只能是一个**带双引号、
+  不含符号和空白的十进制正整数；与该 key 当前 revision 相同才允许更新，不同则返回
+  **`409`** `{"error":{"code":"revision_conflict","message":"If-Match revision does not match current configuration"}}`，
+  且不修改限额、令牌、`used`、预留、账本、决策计数或时钟水位线（冲突在锁内判断、先于一切状态变更）。
+  缺少 `If-Match` 时仍按基线**无条件更新**。
+- key 尚未配置时，即使携带合法的 `If-Match` 也返回 `404 not_found`（不会被误创建）。请求体非法或
+  `If-Match` 格式错误（如 `3`、`"0"`、`*`、`W/"3"`、含空白、多个标签/重复头）均返回 `400 invalid_request`；
+  二者都在**进入锁之前**校验，失败时不产生部分配置或任何部分状态变化（也不推进时钟水位线）。
 - 重新配置时**保留已用额度**：安装新配置前，先按**旧** `refill_per_second` 把上一有效时刻到本次重配时刻
   之间的等待补足（按旧 capacity 封顶），再按**新** capacity 封顶（即 `min(旧速率补足后的令牌, 新 capacity)`）；
   容量扩大不会把桶补满，新速率也不追溯作用于重配前的等待。重配开始时已到期的预留在同一临界区内按
@@ -127,7 +139,9 @@ PYTHONPATH=src python3 -m unittest discover -s tests -v
   路径段数不对、末段不是 `consume`、方法不匹配 ⇒ 先 `404` 且不读体；坏 JSON、未知字段、非空体 ⇒ `400 invalid_request`。
 
 ### `GET /v1/limits/{key}`
-`200 {"limit": {...}, "remaining": <int>, "used": <int>}`（读取也会先按时间补充，体现当前余量；未确认的预留不计入 `used`）。
+`200 {"limit": {...}, "remaining": <int>, "used": <int>}` 并带 `ETag: "<revision>"` 头（revision 与本次
+状态快照在同一把锁内取得，故 ETag 恒与该快照对应的配置一致；读取也会先按时间补充，体现当前余量；
+未确认的预留不计入 `used`）。未配置的 key ⇒ `404 not_found`（无 ETag）。
 
 ### `GET /v1/ledgers/{key}`
 **只读配额账本**，供计费对账：给出形成了实际消耗的每一笔事件，以及与 `GET /v1/limits/{key}` 的 `used` 完全一致的合计。
@@ -202,12 +216,26 @@ PYTHONPATH=src python3 -m unittest discover -s tests -v
 ## 错误语义
 
 ```json
-{"error": {"code": "invalid_request|not_found|over_quota|internal_error", "message": "<可读说明>"}}
+{"error": {"code": "invalid_request|not_found|over_quota|revision_conflict|internal_error", "message": "<可读说明>"}}
 ```
 
-优先级：`Content-Length` 校验先于读体；路由不匹配先于体校验；`invalid_request` 先于 `not_found`/`over_quota`。
+优先级：`Content-Length` 校验先于读体；路由不匹配先于体校验；`invalid_request` 先于 `not_found`/`over_quota`；
+`If-Match`/请求体的 `invalid_request` 在锁前返回，先于 key 的 `not_found`；合法 `If-Match` 对未配置 key 为
+`404 not_found`；已配置 key 上版本不符为 `409 revision_conflict`（二者均在锁内、不改变任何状态）。
+
+## 乐观并发控制与兼容性
+
+- revision 计数的是**成功配置写入**：首次创建为 1，之后每次成功 PUT（含配置完全相同的 PUT）+1；
+  `400`/`404`/`429`/`409` 都不推进 revision，也不改变 ETag。
+- ETag 仅与单键限额配置关联：ledgers、windows、metrics、check、reservations、hierarchies 响应均不带 ETag；
+  同名窗口与令牌桶继续隔离，窗口 PUT/GET 不影响同名限额的 revision。
+- revision 判断与更新在**同一把锁**内完成；PUT 的 ETag 命名本次安装的 revision，GET 的 ETag 与同一快照的
+  状态在同一临界区取出。并发的两个同版本条件 PUT 中恰好一个成功（200，revision+1），另一个 409；后续若用
+  新 ETag 重试即可成功。
+- 除新增 ETag 响应头与可选 `If-Match` 及其 `409` 外，不带 If-Match 的 PUT、GET、check、hierarchies、
+  reservations、ledgers、windows、metrics 的 JSON 形状、状态推进、错误分类与并发保证均不变。
 
 ## 未实现（后续任务候选，非固定题单）
 
-漏桶、跨实例一致、热点键、降级与熔断、配置热更新的原子切换、
+漏桶、跨实例一致、热点键、降级与熔断、
 可观测性与压测基线。

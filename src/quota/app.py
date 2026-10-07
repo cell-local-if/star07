@@ -26,6 +26,12 @@ class LimitNotFound(QuotaError):
     code, status = "not_found", 404
 
 
+class RevisionConflict(QuotaError):
+    """An If-Match precondition named a revision other than the key's current one."""
+
+    code, status = "revision_conflict", 409
+
+
 class OverQuota(QuotaError):
     code, status = "over_quota", 429
 
@@ -41,6 +47,19 @@ class Limit:
 
     def as_json(self) -> dict[str, Any]:
         return {"capacity": self.capacity, "refill_per_second": self.refill_per_second}
+
+
+@dataclass(frozen=True)
+class ConfigureResult:
+    """A successful PUT /v1/limits/{key}: the installed limit plus the revision it now carries.
+
+    Revision starts at 1 on a key's first successful creation and gains exactly 1 on every later
+    successful PUT — even when the new configuration equals the old one — so it counts successful
+    configuration writes, never configuration-value changes.
+    """
+
+    limit: Limit
+    revision: int
 
 
 @dataclass
@@ -203,6 +222,37 @@ def validate_window(payload: Any) -> WindowConfig:
     return WindowConfig(window_seconds, max_events)
 
 
+def validate_if_match(header: Any) -> int:
+    """The sole accepted shape of PUT's optional optimistic-concurrency precondition.
+
+    Exactly one entity tag: a double-quoted decimal positive integer with no whitespace or other
+    symbols inside or out — ``"3"``, never ``3``, ``*``, ``W/"3"`` or a list. A missing header is
+    handled by the caller as "no precondition"; this function validates only a header that is
+    present, and like body validation it runs before the lock so a malformed precondition can
+    never partially configure a key or advance the clock watermark.
+    """
+    if not isinstance(header, str):
+        raise InvalidRequest('If-Match must be a quoted positive integer, e.g. "3"')
+    if len(header) < 3 or not header.startswith('"') or not header.endswith('"'):
+        raise InvalidRequest('If-Match must be a quoted positive integer, e.g. "3"')
+    digits = header[1:-1]
+    # Canonical decimal only: no sign, whitespace, symbol, and no leading zero ("01" is not the
+    # shape the server's own ETags ever take, so it names no revision rather than aliasing 1).
+    if not digits or not all("0" <= char <= "9" for char in digits):
+        raise InvalidRequest('If-Match must be a quoted positive integer, e.g. "3"')
+    if len(digits) > 1 and digits[0] == "0":
+        raise InvalidRequest('If-Match must be a quoted positive integer, e.g. "3"')
+    revision = int(digits)
+    if revision < 1:
+        raise InvalidRequest('If-Match must be a quoted positive integer, e.g. "3"')
+    return revision
+
+
+def etag_header(revision: int) -> str:
+    """The ETag for a configuration revision: the decimal revision wrapped in double quotes."""
+    return f'"{revision}"'
+
+
 class Limiter:
     """One token bucket per tenant key. `now` is a seconds callable, injected for tests.
 
@@ -220,6 +270,10 @@ class Limiter:
         self._lock = threading.RLock()
         self._limits: dict[str, Limit] = {}
         self._buckets: dict[str, Bucket] = {}
+        # Configuration revision per key: 1 at first successful creation, +1 per later successful
+        # PUT (even when the configuration values are unchanged). It exists exactly while a limit
+        # does and is the only state the ETag/If-Match optimistic-concurrency protocol observes.
+        self._revisions: dict[str, int] = {}
         self._reservations: dict[str, Reservation] = {}
         # Confirmed holds leave the active registry for good; the value is the exact first consume
         # response, replayed verbatim for idempotent retries (used is never booked a second time).
@@ -269,19 +323,39 @@ class Limiter:
             self._watermark = reading
         return self._watermark
 
-    def configure(self, key: Any, payload: Any) -> Limit:
+    def configure(self, key: Any, payload: Any,
+                  expected_revision: int | None = None) -> ConfigureResult:
+        """Create or hot-reconfigure one key's bucket; optionally under an If-Match precondition.
+
+        `key`, the body and (when present) `expected_revision` are all validated before the lock,
+        so either rejection is 400 with no partial state. Inside the one critical section the
+        existence test, the revision comparison and the whole install run atomically: a legal
+        If-Match on an unconfigured key is 404 and creates nothing; a revision that does not equal
+        the key's current one is 409 *before* the clock is sampled or anything mutates, so tokens,
+        used, reservations, ledgers, decision counts and the high-water mark are all untouched.
+        A missing precondition keeps the baseline unconditional write. Every successful write —
+        creation or update, even an identical re-PUT — advances the key's revision by exactly 1.
+        """
         key = validate_key(key)
         limit = validate_limit(payload)
         with self._lock:
-            now = self._tick()
             if key not in self._limits:
+                if expected_revision is not None:
+                    # Not even the clock is sampled: a conditional write to an unconfigured key
+                    # leaves the watermark and every other piece of state exactly as it was.
+                    raise LimitNotFound(f"no limit configured for {key!r}")
+                now = self._tick()
                 self._limits[key] = limit
                 self._buckets[key] = Bucket(limit.capacity, now)
-                return limit
+                self._revisions[key] = 1
+                return ConfigureResult(limit, 1)
+            if expected_revision is not None and self._revisions[key] != expected_revision:
+                raise RevisionConflict("If-Match revision does not match current configuration")
             # Hot reconfiguration of a live bucket. The wait since the bucket's last effective
             # moment is first refilled at the OLD rate (capped at the OLD capacity); only then is
             # the new configuration installed, so the new rate governs nothing before this moment
             # and a capacity increase never conjures a full bucket.
+            now = self._tick()
             self._refill(key, now)
             self._limits[key] = limit
             # Due holds settle after the old-rate refill and are credited against the NEW capacity
@@ -290,13 +364,33 @@ class Limiter:
             bucket = self._buckets[key]
             bucket.tokens = min(float(limit.capacity), bucket.tokens)
             bucket.updated_at = now
-        return limit
+            self._revisions[key] += 1
+            return ConfigureResult(limit, self._revisions[key])
 
     def limit(self, key: str) -> Limit:
         with self._lock:
             if key not in self._limits:
                 raise LimitNotFound(f"no limit configured for {key!r}")
             return self._limits[key]
+
+    def state_snapshot(self, key: str) -> tuple[dict[str, Any], int]:
+        """The GET /v1/limits/{key} body and the current revision, from one locked snapshot.
+
+        Both values are produced in the same critical section, so the ETag a caller sees can
+        never name a revision other than the one the returned state belongs to — a PUT landing
+        between a separate state read and a separate revision read is impossible.
+        """
+        with self._lock:
+            now = self._tick()
+            limit = self.limit(key)
+            self._expire_due(key, now)
+            bucket = self._refill(key, now)
+            body = {"limit": limit.as_json(), "remaining": int(bucket.tokens),
+                    "used": sum(bucket.cost_history)}
+            return body, self._revisions[key]
+
+    def state(self, key: str) -> dict[str, Any]:
+        return self.state_snapshot(key)[0]
 
     def _refill(self, key: str, now: float) -> Bucket:
         limit = self._limits[key]
@@ -607,14 +701,6 @@ class Limiter:
             self._hierarchy_consumed[reservation_id] = snapshot
             return dict(snapshot)
 
-    def state(self, key: str) -> dict[str, Any]:
-        with self._lock:
-            now = self._tick()
-            limit = self.limit(key)
-            self._expire_due(key, now)
-            bucket = self._refill(key, now)
-            return {"limit": limit.as_json(), "remaining": int(bucket.tokens), "used": sum(bucket.cost_history)}
-
     def ledger(self, key: str, event_limit: int = 100) -> dict[str, Any]:
         """Read-only billing ledger: the accepted spends behind GET /v1/limits/{key}'s `used`.
 
@@ -819,7 +905,8 @@ def make_handler(limiter: Limiter) -> type[BaseHTTPRequestHandler]:
                 if parts == ["health"]:
                     return self._send(200, {"status": "ok"})
                 if len(parts) == 3 and parts[:2] == ["v1", "limits"]:
-                    return self._send(200, limiter.state(parts[2]))
+                    state, revision = limiter.state_snapshot(parts[2])
+                    return self._send(200, state, {"ETag": etag_header(revision)})
                 if len(parts) == 3 and parts[:2] == ["v1", "ledgers"]:
                     # Route matched first: query validation now beats the key's 404, just as body
                     # validation precedes quota classification everywhere else.
@@ -847,8 +934,19 @@ def make_handler(limiter: Limiter) -> type[BaseHTTPRequestHandler]:
                         window = limiter.configure_window(parts[2], self._read_json())
                         return self._send(200, {"key": parts[2], "window": window.as_json()})
                     return self._send(404, {"error": {"code": "not_found"}})
-                limit = limiter.configure(parts[2], self._read_json())
-                return self._send(200, {"key": parts[2], "limit": limit.as_json()})
+                # The precondition belongs to this one route: header and body are both validated
+                # before the lock (a repeated If-Match line is a list of tags and is never the one
+                # accepted shape), so neither failure can partially configure anything.
+                if_match_values = self.headers.get_all("If-Match")
+                if if_match_values is not None:
+                    if len(if_match_values) != 1:
+                        raise InvalidRequest('If-Match must be a quoted positive integer, e.g. "3"')
+                    expected_revision: int | None = validate_if_match(if_match_values[0])
+                else:
+                    expected_revision = None
+                result = limiter.configure(parts[2], self._read_json(), expected_revision)
+                return self._send(200, {"key": parts[2], "limit": result.limit.as_json()},
+                                  {"ETag": etag_header(result.revision)})
             except QuotaError as error:
                 return self._send(error.status, {"error": {"code": error.code, "message": str(error)}})
             except Exception:
