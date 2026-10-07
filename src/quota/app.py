@@ -32,6 +32,12 @@ class RevisionConflict(QuotaError):
     code, status = "revision_conflict", 409
 
 
+class IdempotencyConflict(QuotaError):
+    """A replay of an Idempotency-Key carried different key/cost/ttl_seconds than its first use."""
+
+    code, status = "idempotency_conflict", 409
+
+
 class OverQuota(QuotaError):
     code, status = "over_quota", 429
 
@@ -99,6 +105,23 @@ class Reservation:
 
     def expires_at(self) -> float:
         return self.created_at + self.ttl_seconds
+
+
+@dataclass(frozen=True)
+class IdempotentReservation:
+    """One Idempotency-Key binding for the single-key create endpoint.
+
+    Pins the exact validated request parameters of the first successful POST and the exact first
+    200 response. The binding is made only after the hold succeeds and is never removed: the
+    reservation's own expiry, rollback or consume end the hold's life but the binding keeps
+    replaying the first creation response, so a retried create can never occupy tokens a second
+    time. Process memory only, like every other piece of state.
+    """
+
+    key: str
+    cost: int
+    ttl_seconds: int
+    response: dict[str, Any]
 
 
 @dataclass
@@ -275,6 +298,25 @@ def validate_leaky_bucket(payload: Any) -> LeakyBucketConfig:
     return LeakyBucketConfig(int(capacity), float(rate))
 
 
+def validate_idempotency_key(header: Any) -> str:
+    """The sole accepted shape of POST /v1/reservations' optional Idempotency-Key.
+
+    One header line whose value is 1..128 non-whitespace ASCII characters — printable ASCII
+    0x21..0x7E only (no space, tab, CR, LF or other control, no DEL, no non-ASCII byte). A missing
+    header is handled by the caller as "no key"; this function validates only a header that is
+    present, and like every body validator it runs before the body is read and before the lock, so
+    a malformed key can never partially create a reservation or advance the clock watermark.
+    """
+    if not isinstance(header, str) or not 1 <= len(header) <= 128:
+        raise InvalidRequest(
+            "Idempotency-Key must be a single value of 1 to 128 non-whitespace ASCII characters")
+    for char in header:
+        if not 0x21 <= ord(char) <= 0x7E:
+            raise InvalidRequest(
+                "Idempotency-Key must be a single value of 1 to 128 non-whitespace ASCII characters")
+    return header
+
+
 def validate_if_match(header: Any) -> int:
     """The sole accepted shape of PUT's optional optimistic-concurrency precondition.
 
@@ -328,6 +370,15 @@ class Limiter:
         # does and is the only state the ETag/If-Match optimistic-concurrency protocol observes.
         self._revisions: dict[str, int] = {}
         self._reservations: dict[str, Reservation] = {}
+        # Idempotency-Key bindings for POST /v1/reservations only: header value -> the first
+        # successful create's exact parameters and exact 200 response. A binding is written only
+        # when a create succeeds and is never deleted (hold expiry, rollback and consume remove the
+        # reservation, not the binding), so a retried create keeps replaying instead of occupying
+        # tokens again. Failed creates write nothing, so the same key can still have a first use.
+        self._reservation_idempotency: dict[str, IdempotentReservation] = {}
+        # One event per header value while its first create is still inside the critical section;
+        # concurrent identical requests wait on it instead of racing to a second occupation.
+        self._reservation_idempotency_inflight: dict[str, threading.Event] = {}
         # Confirmed holds leave the active registry for good; the value is the exact first consume
         # response, replayed verbatim for idempotent retries (used is never booked a second time).
         self._consumed: dict[str, dict[str, Any]] = {}
@@ -659,6 +710,38 @@ class Limiter:
             return {"reservation_id": reservation.reservation_id, "keys": list(keys), "cost": cost,
                     "ttl_seconds": ttl_seconds, "layers": layers}
 
+    def _reserve_locked(self, key: str, cost: int, ttl_seconds: int) -> dict[str, Any]:
+        """The single-key hold judgement and creation. Caller holds the lock and has validated."""
+        # Same unsatisfiable-cost rule as check(): a legal cost above the key's CURRENT
+        # capacity can never be held, however long the caller waits, so it is 400
+        # invalid_request instead of a 429 hinting a finite wait, and no Retry-After is
+        # sent. The comparison reads the same locked configuration a concurrent PUT
+        # installs, so each request sees exactly one capacity — before or after the
+        # reconfigure, never a torn intermediate — and the branch runs before the clock is
+        # sampled: no watermark advance, no expiry settle, no refill, no deduction, no
+        # reservation and no decision count. An unconfigured key has no capacity to compare
+        # against and keeps the baseline 404 (clock sampled exactly as before).
+        limit = self._limits.get(key)
+        if limit is not None and cost > limit.capacity:
+            raise InvalidRequest(
+                f"cost {cost} exceeds capacity {limit.capacity} for key {key!r}")
+        now = self._tick()
+        limit = self.limit(key)
+        self._expire_due(key, now)
+        bucket = self._refill(key, now)
+        if bucket.tokens < cost:
+            deficit = cost - bucket.tokens
+            self._record_decision("reservation", "over_quota")
+            raise OverQuota(f"key {key!r} has {bucket.tokens:.3f} tokens, needs {cost}",
+                            deficit / limit.refill_per_second)
+        bucket.tokens -= cost
+        reservation = Reservation(uuid.uuid4().hex, key, cost, now, ttl_seconds)
+        self._reservations[reservation.reservation_id] = reservation
+        self._record_decision("reservation", "allowed")
+        return {"reservation_id": reservation.reservation_id, "key": key, "cost": cost,
+                "remaining": int(bucket.tokens), "capacity": limit.capacity,
+                "ttl_seconds": ttl_seconds}
+
     def reserve(self, key: Any, cost: Any, ttl_seconds: Any = DEFAULT_TTL_SECONDS) -> dict[str, Any]:
         """Atomically hold `cost` tokens, exactly as check() judges them, without booking them as used.
 
@@ -669,35 +752,66 @@ class Limiter:
         cost = validate_cost(cost)
         ttl_seconds = validate_ttl(ttl_seconds)
         with self._lock:
-            # Same unsatisfiable-cost rule as check(): a legal cost above the key's CURRENT
-            # capacity can never be held, however long the caller waits, so it is 400
-            # invalid_request instead of a 429 hinting a finite wait, and no Retry-After is
-            # sent. The comparison reads the same locked configuration a concurrent PUT
-            # installs, so each request sees exactly one capacity — before or after the
-            # reconfigure, never a torn intermediate — and the branch runs before the clock is
-            # sampled: no watermark advance, no expiry settle, no refill, no deduction, no
-            # reservation and no decision count. An unconfigured key has no capacity to compare
-            # against and keeps the baseline 404 (clock sampled exactly as before).
-            limit = self._limits.get(key)
-            if limit is not None and cost > limit.capacity:
-                raise InvalidRequest(
-                    f"cost {cost} exceeds capacity {limit.capacity} for key {key!r}")
-            now = self._tick()
-            limit = self.limit(key)
-            self._expire_due(key, now)
-            bucket = self._refill(key, now)
-            if bucket.tokens < cost:
-                deficit = cost - bucket.tokens
-                self._record_decision("reservation", "over_quota")
-                raise OverQuota(f"key {key!r} has {bucket.tokens:.3f} tokens, needs {cost}",
-                                deficit / limit.refill_per_second)
-            bucket.tokens -= cost
-            reservation = Reservation(uuid.uuid4().hex, key, cost, now, ttl_seconds)
-            self._reservations[reservation.reservation_id] = reservation
-            self._record_decision("reservation", "allowed")
-            return {"reservation_id": reservation.reservation_id, "key": key, "cost": cost,
-                    "remaining": int(bucket.tokens), "capacity": limit.capacity,
-                    "ttl_seconds": ttl_seconds}
+            return self._reserve_locked(key, cost, ttl_seconds)
+
+    def reserve_idempotent(self, idempotency_key: Any,
+                          key: Any, cost: Any,
+                          ttl_seconds: Any = DEFAULT_TTL_SECONDS) -> dict[str, Any]:
+        """Create a single-key hold under an Idempotency-Key: one occupation per header value.
+
+        The header and body parameters are all validated before the lock, exactly as the keyless
+        path validates them, so a malformed request reaches no clock sample and binds nothing.
+        Inside the one critical section a stored binding for the header value wins immediately:
+        identical parameters replay the exact first 200 response with no clock sample, no settle,
+        no refill, no deduction, no new reservation and no decision count; differing parameters
+        are 409 idempotency_conflict and likewise touch nothing — no token, hold, used, ledger,
+        metric or watermark. A concurrent first use is awaited (outside the lock) and then replayed,
+        so however many identical requests arrive, exactly one of them ever judges quota, occupies
+        tokens and counts as the one allowed reservation decision. Only a request that itself
+        creates successfully installs a binding: 400/404/429 leave the header value free for a
+        later legal first use.
+        """
+        idempotency_key = validate_idempotency_key(idempotency_key)
+        key = validate_key(key)
+        cost = validate_cost(cost)
+        ttl_seconds = validate_ttl(ttl_seconds)
+        # Elect exactly one first-use leader per header value. Followers wait outside the lock for
+        # the leader's result, then loop: a stored binding replays or conflicts; a leader that
+        # failed without binding frees the value and exactly one waiter is elected in its place.
+        while True:
+            with self._lock:
+                binding = self._reservation_idempotency.get(idempotency_key)
+                if binding is not None:
+                    if (binding.key, binding.cost, binding.ttl_seconds) != (key, cost, ttl_seconds):
+                        raise IdempotencyConflict(
+                            f"Idempotency-Key {idempotency_key!r} was first used with different "
+                            "key, cost or ttl_seconds")
+                    # Replay the frozen first response: nothing is sampled, settled, deducted or counted.
+                    return dict(binding.response)
+                inflight = self._reservation_idempotency_inflight.get(idempotency_key)
+                if inflight is None:
+                    inflight = threading.Event()
+                    self._reservation_idempotency_inflight[idempotency_key] = inflight
+                    break
+            inflight.wait()
+        try:
+            with self._lock:
+                response = self._reserve_locked(key, cost, ttl_seconds)
+        except BaseException:
+            # A failed first use binds nothing: remove only our own election and release waiters,
+            # so the same header value still admits a later legal first create.
+            with self._lock:
+                if self._reservation_idempotency_inflight.get(idempotency_key) is inflight:
+                    del self._reservation_idempotency_inflight[idempotency_key]
+                inflight.set()
+            raise
+        with self._lock:
+            self._reservation_idempotency[idempotency_key] = IdempotentReservation(
+                key, cost, ttl_seconds, dict(response))
+            if self._reservation_idempotency_inflight.get(idempotency_key) is inflight:
+                del self._reservation_idempotency_inflight[idempotency_key]
+            inflight.set()
+        return dict(response)
 
     def rollback(self, reservation_id: str) -> dict[str, Any]:
         with self._lock:
@@ -1202,12 +1316,30 @@ def make_handler(limiter: Limiter) -> type[BaseHTTPRequestHandler]:
                     result = limiter.hierarchy_consume(parts[3])
                     return self._send(200, result)
                 if parts == ["v1", "reservations"]:
+                    # The optional Idempotency-Key belongs to this one route. It is validated
+                    # before the body is read and before the lock — present-but-empty, repeated,
+                    # over-long, whitespace-bearing or non-ASCII values are 400 invalid_request
+                    # with no body adopted, no state change, no Retry-After. A missing header
+                    # keeps the baseline server-deduplicated behaviour byte for byte.
+                    idem_values = self.headers.get_all("Idempotency-Key")
+                    if idem_values is not None:
+                        if len(idem_values) != 1:
+                            raise InvalidRequest(
+                                "Idempotency-Key must be a single value of 1 to 128 "
+                                "non-whitespace ASCII characters")
+                        idem_key: str | None = validate_idempotency_key(idem_values[0])
+                    else:
+                        idem_key = None
                     body = self._read_json()
                     if not isinstance(body, dict) or set(body) - {"key", "cost", "ttl_seconds"}:
                         raise InvalidRequest(
                             'body must be {"key": <string>, "cost": <integer>, "ttl_seconds": <integer 1..86400>}')
                     ttl = body.get("ttl_seconds", DEFAULT_TTL_SECONDS)
-                    result = limiter.reserve(body.get("key"), body.get("cost", 1), ttl)
+                    if idem_key is None:
+                        result = limiter.reserve(body.get("key"), body.get("cost", 1), ttl)
+                    else:
+                        result = limiter.reserve_idempotent(
+                            idem_key, body.get("key"), body.get("cost", 1), ttl)
                     return self._send(200, result)
                 if len(parts) == 4 and parts[:2] == ["v1", "reservations"] and parts[3] == "consume":
                     body = self._read_json()
