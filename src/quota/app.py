@@ -140,10 +140,16 @@ class WindowConfig:
 
 @dataclass
 class SlidingWindow:
-    """Accepted-admission timestamps for one window key, oldest first; nothing else ever lands here."""
+    """Accepted admissions for one window key, oldest first; nothing else ever lands here.
+
+    Each admission is an (effective_at, cost) pair: a check may register any integer cost in
+    1..max_events, so the live occupancy is the COST SUM of the surviving pairs rather than
+    their count. Same-moment admissions keep their relative append order and expire together
+    at effective_at + window_seconds.
+    """
 
     config: WindowConfig
-    events: list[float] = field(default_factory=list)
+    events: list[tuple[float, int]] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -921,23 +927,29 @@ class Limiter:
             }
 
     def _expire_window(self, window: SlidingWindow, now: float) -> None:
-        """Drop every window event whose age has reached window_seconds at this effective moment.
+        """Drop every window admission whose age has reached window_seconds at this effective moment.
 
-        An event admitted at effective_at leaves the window at effective_at + window_seconds, i.e.
-        it is stale once effective_at <= now - window_seconds: the boundary is inclusive, so an old
-        event stamped exactly on the edge is settled before admission is judged. Admissions are
-        stamped with the non-decreasing watermark, so the surviving timestamps are an ordered tail
-        and one prefix drop settles them all. A stalled clock produces an identical cutoff and drops
-        nothing; a regressed reading is clamped to the watermark before the cutoff is ever computed.
+        An admission stamped at effective_at leaves the window at effective_at + window_seconds,
+        i.e. it is stale once effective_at <= now - window_seconds: the boundary is inclusive, so
+        an old admission stamped exactly on the edge (including every other admission sharing
+        that same moment) settles before admission is judged. Admissions are stamped with the
+        non-decreasing watermark, so the surviving timestamps are an ordered tail and one prefix
+        drop settles them all. A stalled clock produces an identical cutoff and drops nothing; a
+        regressed reading is clamped to the watermark before the cutoff is ever computed.
         Caller holds the lock and supplies the operation's single effective moment.
         """
         cutoff = now - window.config.window_seconds
         events = window.events
         index = 0
-        while index < len(events) and events[index] <= cutoff:
+        while index < len(events) and events[index][0] <= cutoff:
             index += 1
         if index:
             del events[:index]
+
+    @staticmethod
+    def _window_used(window: SlidingWindow) -> int:
+        """The live occupancy: the cost sum of every surviving admission."""
+        return sum(cost for _, cost in window.events)
 
     def configure_window(self, key: Any, payload: Any) -> WindowConfig:
         """Create or replace a window's configuration while keeping its admitted history.
@@ -960,25 +972,10 @@ class Limiter:
         return config
 
     def window_state(self, key: Any) -> dict[str, Any]:
-        """The same {window, used, remaining} snapshot a check at this effective moment would see."""
-        key = validate_key(key)
-        with self._lock:
-            now = self._tick()
-            window = self._windows.get(key)
-            if window is None:
-                raise LimitNotFound(f"no window configured for {key!r}")
-            self._expire_window(window, now)
-            used = len(window.events)
-            return {"window": window.config.as_json(), "used": used,
-                    "remaining": window.config.max_events - used}
+        """The same {window, used, remaining} snapshot a cost-1 check at this effective moment would see.
 
-    def window_check(self, key: Any) -> dict[str, Any]:
-        """Atomically admit one request into the sliding window, counting successful admissions only.
-
-        Stale events leave first (boundary inclusive). With fewer than max_events live events the
-        request is counted at this single effective moment and the returned used already includes
-        it; a full window rejects without appending, and Retry-After is the exact wait until the
-        earliest live event leaves, which every concurrent reject at this moment computes alike.
+        used is the surviving admissions' cost SUM, not their count; remaining is max_events minus
+        that sum (and may be negative when max_events was lowered below the live occupancy).
         """
         key = validate_key(key)
         with self._lock:
@@ -987,18 +984,79 @@ class Limiter:
             if window is None:
                 raise LimitNotFound(f"no window configured for {key!r}")
             self._expire_window(window, now)
+            used = self._window_used(window)
+            return {"window": window.config.as_json(), "used": used,
+                    "remaining": window.config.max_events - used}
+
+    def window_check(self, key: Any, cost: Any = 1) -> dict[str, Any]:
+        """Atomically admit one weighted request into the sliding window.
+
+        `cost` defaults to 1 and follows the shared cost rule (a non-boolean integer in
+        1..1000000), validated with the key before the lock. Inside the one critical section a
+        legal cost above a CONFIGURED window's CURRENT max_events is rejected as invalid_request
+        before the clock is sampled: such a request can never fit however long the caller waits,
+        so the rejection samples no clock (no watermark advance), evicts no admissions, changes no
+        used, sends no Retry-After and counts no window_check decision. An unknown window has no
+        max_events to compare against and keeps the baseline 404 (the clock is sampled exactly as
+        before and the lookup never creates one).
+
+        After that single sample, every admission whose effective_at plus window_seconds has
+        reached this moment (the boundary is inclusive, and same-moment admissions leave together
+        as one batch) is dropped. The live used is the surviving cost sum. When used + cost <=
+        max_events the cost is admitted at this single effective moment and the returned used
+        already includes it; otherwise the cost enters no history, one over_quota decision is
+        counted, and Retry-After is the wait until the oldest same-moment batch whose cumulative
+        released cost first makes room for this request frees enough capacity — i.e. until that
+        batch's moment + window_seconds, which every concurrent reject at this moment computes
+        identically. cost exactly equal to max_events fits an otherwise empty window.
+        """
+        key = validate_key(key)
+        cost = validate_cost(cost)
+        with self._lock:
+            # The unsatisfiable boundary is decided before the clock is sampled, exactly as on
+            # the token-bucket entries: a configured window whose CURRENT max_events can never
+            # hold this legal cost is 400 invalid_request with no eviction, no occupancy change,
+            # no metric, no Retry-After and no watermark advance. The comparison reads the same
+            # locked configuration a concurrent PUT installs, so each request sees exactly one
+            # max_events — before or after the reconfigure, never a torn value. An unknown window
+            # has no max_events to compare against and keeps the baseline 404 (clock sampled
+            # exactly as before, and the lookup never creates a window).
+            window = self._windows.get(key)
+            if window is not None and cost > window.config.max_events:
+                raise InvalidRequest(
+                    f"cost {cost} exceeds max_events {window.config.max_events} for key {key!r}")
+            now = self._tick()
+            if window is None:
+                raise LimitNotFound(f"no window configured for {key!r}")
+            self._expire_window(window, now)
             config = window.config
-            used = len(window.events)
-            if used >= config.max_events:
-                retry_after = window.events[0] + config.window_seconds - now
-                self._record_decision("window_check", "over_quota")
-                raise OverQuota(f"window for {key!r} is full: {used}/{config.max_events} events",
-                                retry_after)
-            window.events.append(now)
-            self._record_decision("window_check", "allowed")
-            used += 1
-            return {"allowed": True, "used": used, "remaining": config.max_events - used,
-                    "limit": config.max_events, "window_seconds": config.window_seconds}
+            used = self._window_used(window)
+            if used + cost <= config.max_events:
+                window.events.append((now, cost))
+                self._record_decision("window_check", "allowed")
+                used += cost
+                return {"allowed": True, "used": used, "remaining": config.max_events - used,
+                        "limit": config.max_events, "window_seconds": config.window_seconds}
+            # Over quota: walk the surviving admissions oldest-first, batching same-moment entries
+            # (they leave together) and accumulating released cost until dropping this batch opens
+            # enough room; the wait ends at that batch's leave moment. Events are timestamp-sorted
+            # by admission construction, and the loop always reaches a sufficient batch because
+            # cost <= max_events was established above.
+            released = 0
+            index = 0
+            events = window.events
+            while index < len(events):
+                batch_moment = events[index][0]
+                while index < len(events) and events[index][0] == batch_moment:
+                    released += events[index][1]
+                    index += 1
+                if used - released + cost <= config.max_events:
+                    break
+            retry_after = batch_moment + config.window_seconds - now
+            self._record_decision("window_check", "over_quota")
+            raise OverQuota(
+                f"window for {key!r} is full: {used}/{config.max_events} used, needs {cost}",
+                retry_after)
 
     def _leak(self, bucket: LeakyBucket, now: float) -> LeakyBucket:
         """Drain one leaky bucket at its CURRENT rate for the wait since its last effective moment.
@@ -1312,10 +1370,14 @@ def make_handler(limiter: Limiter) -> type[BaseHTTPRequestHandler]:
                     result = limiter.consume(parts[2])
                     return self._send(200, result)
                 if len(parts) == 4 and parts[:2] == ["v1", "windows"] and parts[3] == "check":
+                    # The key rides in the path, so the body is an object carrying at most a cost:
+                    # {} (cost omitted, defaulting to 1) is the empty-object case. Anything else —
+                    # arrays, scalars, unknown fields, malformed JSON — is invalid_request and the
+                    # request never reaches the lock, mirroring the leaky-bucket check exactly.
                     body = self._read_json()
-                    if not isinstance(body, dict) or body:
-                        raise InvalidRequest('body must be an empty JSON object {}')
-                    result = limiter.window_check(parts[2])
+                    if not isinstance(body, dict) or set(body) - {"cost"}:
+                        raise InvalidRequest('body must be {} or {"cost": <integer>}')
+                    result = limiter.window_check(parts[2], body.get("cost", 1))
                     return self._send(200, result)
                 if len(parts) == 4 and parts[:2] == ["v1", "leaky-buckets"] and parts[3] == "check":
                     # No query parameters on this route either: reject before reading the body.

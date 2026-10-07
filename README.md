@@ -201,19 +201,37 @@ PYTHONPATH=src python3 -m unittest discover -s tests -v
   且不改任何状态。
 
 ### `POST /v1/windows/{key}/check`
-请求体**必须是空 JSON 对象 `{}`**（非空对象、非对象、畸形 JSON 或缺 `Content-Length` ⇒ `400 invalid_request`）。
-- 只统计窗口内**已成功准入**的请求：未达到 `max_events` 时在同一临界区内原子计入本次，
-  返回 `200 {"allowed": true, "used": <int>, "remaining": <int>, "limit": <int>, "window_seconds": <int>}`；
-  `used` 包含本次，`remaining = max_events - used`，`limit = max_events`。
-- 窗口满：**`429`** `{"error":{"code":"over_quota",...}}` 并带 **`Retry-After`**——最早有效事件离开窗口
-  所需的精确秒数（`最早事件时刻 + window_seconds - 当前有效时刻`），与令牌桶同一口径：按毫秒**向上取整**、
-  保留三位小数（亚毫秒也给 `0.001`，永不为 `0.000`）；被拒请求不计入。
-- 未知窗口 ⇒ `404 not_found`；路径段数不对、末段不是 `check` 或方法不匹配 ⇒ **先**返回 `404 not_found`
-  且不读请求体。
+请求体只接受**空对象或仅含可选 `cost` 的对象**：`{}`（`cost` 缺省为 **1**）或
+`{"cost": <int 1..1000000>}`。`cost` 规则与 `POST /v1/check` 相同（非布尔整数，缺省 1；
+布尔值、浮点数、0、超出范围均非法）。空对象仍等价于 `{"cost": 1}`，响应字段不增加。
+- 每次成功检查登记一个**加权占用** `(effective_at, cost)`，窗口占用量 `used` 为所有**存活占用的 cost 总和**
+  （不再是条目数）。成功检查在**一次原子判定**中先淘汰所有满足
+  `effective_at + window_seconds <= 当前有效时刻` 的旧占用——**边界取大于等于，恰在淘汰边界的历史占用先离开，
+  同一时刻的占用作为一批一起释放**——然后才判断：淘汰后的 `used + cost <= max_events` 时把本次 cost
+  作为当前有效时刻的占用计入，返回
+  `200 {"allowed": true, "used": <int>, "remaining": <int>, "limit": <int>, "window_seconds": <int>}`；
+  `used` 含本次，`remaining = max_events - used`，`limit = max_events`。
+- 放不下（`used + cost > max_events`）：本次 **cost 不进入历史**，返回 **`429`**
+  `{"error":{"code":"over_quota",...}}` 并带 **`Retry-After`**——等待**最早一批**旧占用过期、且该批离开后
+  **累计释放的 cost 首次足以容纳本次请求**的边界时刻（从最旧的存活占用起按同一时刻分批累计，
+  取第一个使 `used - 累计释放 + cost <= max_events` 的批次，等待秒数为
+  `该批时刻 + window_seconds - 当前有效时刻`）；同一时刻的占用一起释放。格式与令牌桶 429 同一口径：
+  按毫秒**向上取整**、保留三位小数（亚毫秒也给 `0.001`，永不为 `0.000`）；被拒请求不计入占用。
+- 已配置窗口的**合法 `cost` 大于当前 `max_events`** 时该请求永远不可能放入 ⇒ **`400 invalid_request`**
+  （`message` 说明 cost 超过 max_events），不返回 200/429、不带 `Retry-After`；该判断与并发 PUT 在同一临界区内
+  读取单一配置快照（每个请求只见更新前或更新后的一个 `max_events`），且在**采样时钟之前**返回——不推进水位线、
+  **不淘汰占用、不改变 used、不计 window_check 指标**。`cost` 等于 `max_events` 仍是合法请求（空窗时可直接放入）。
+- 非对象、含未知字段、`cost` 非法（含布尔/浮点/缺省以外形状）、畸形 JSON、缺 `Content-Length`
+  ⇒ `400 invalid_request`（均在**进入锁之前**拒绝）；**格式合法**但窗口未知 ⇒ **`404 not_found`**，
+  并且**不创建窗口**；非法 key 仍为 `400 invalid_request`（格式校验先于窗口查找）；路径段数不对、末段不是
+  `check` 或方法不匹配 ⇒ **先**返回 `404 not_found` 且不读请求体。
+- **指标口径**：每次**格式合法**的 POST 检查——无论允许（200）还是 over_quota（429）——都只让
+  `window_check` 对应计数加一；`400`（含 cost 超过 max_events 与体格式错误）和 `404` **不计数**。
 
 ### `GET /v1/windows/{key}`
 返回 check 同一有效时刻下的同一快照：`200 {"window": {...}, "used": <int>, "remaining": <int>}`
-（先淘汰窗外事件再计数；未知窗口 ⇒ `404 not_found`）。
+（先淘汰窗外占用再计数；`used` 为存活占用的 **cost 总和**，`remaining = max_events - used`；
+未知窗口 ⇒ `404 not_found`）。
 
 ### `GET /v1/metrics`
 **只读累计决策观测**：返回本进程内 Limiter 创建以来五类额度决策的累计次数，形状固定为
@@ -234,11 +252,11 @@ PYTHONPATH=src python3 -m unittest discover -s tests -v
 
 #### 滑动窗口的时间语义（确定性）
 - 有效时刻沿用令牌桶的**单调时钟高水位线**口径，与令牌桶共用同一把锁、同一次 `_tick`：每个公开操作
-  进入锁后只采样一次；时钟停住时淘汰截止线不变、不淘汰事件；读数回拨视为停留在水位线，恢复后
-  回拨区间不会被重复计入（已准入事件不会因此提前或延后离开）。
-- 事件在 `effective_at + window_seconds` 处到期，即 `effective_at <= now - window_seconds` 即为窗外：
-  **边界取大于等于，恰在边界的旧事件先淘汰**，然后才判断本次准入。
-- 并发 check 与 PUT 更新在同一把锁下串行：既不会超过 `max_events`，也不会重复计数或漏计。
+  进入锁后只采样一次；时钟停住时淘汰截止线不变、不淘汰占用；读数回拨视为停留在水位线，恢复后
+  回拨区间不会被重复计入（已准入占用不会因此提前或延后离开）。
+- 占用在 `effective_at + window_seconds` 处到期，即 `effective_at <= now - window_seconds` 即为窗外：
+  **边界取大于等于，恰在边界的历史占用先淘汰**（同一时刻的占用作为一批一起离开），然后才判断本次准入。
+- 并发 check 与 PUT 更新在同一把锁下串行：存活占用的 cost 总和既不会超过 `max_events`，也不会重复计数或漏计。
 
 #### 与令牌桶的隔离
 - 窗口只存进程内存，与同名令牌桶 key **相互隔离**：`PUT /v1/windows/k` 不创建 `/v1/limits/k`，反之亦然。

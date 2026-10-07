@@ -338,19 +338,28 @@ class WindowHttpTests(unittest.TestCase):
                                        {"window_seconds": 10, "max_events": 1})
         self.assertEqual((status, body["error"]["code"]), (400, "invalid_request"))
 
-    def test_check_body_must_be_empty_object(self) -> None:
+    def test_check_body_is_empty_object_or_cost_only_object(self) -> None:
         self.request("PUT", "/v1/windows/h-3", {"window_seconds": 10, "max_events": 3})
         path = "/v1/windows/h-3/check"
-        for payload in (b"", b"[]", b"null", b"5", b'"x"', b'{"x": 1}', b'{"allowed": true}'):
+        # The empty object and a cost-only object are the two accepted shapes; cost 1 admits
+        # the empty-object case and cost 2 the weighted one, sharing one occupancy budget.
+        status, body, _ = self.request("POST", path, {})
+        self.assertEqual((status, body["used"], body["remaining"]), (200, 1, 2))
+        status, body, _ = self.request("POST", path, {"cost": 2})
+        self.assertEqual((status, body["used"], body["remaining"]), (200, 3, 0))
+        # Every other JSON shape stays 400 invalid_request.
+        for payload in (b"", b"[]", b"null", b"5", b'"x"', b'{"x": 1}', b'{"allowed": true}',
+                        b'{"cost": 0}', b'{"cost": true}', b'{"cost": 1.5}',
+                        b'{"cost": 4}', b'{"cost": 1, "x": 1}'):
             status, parsed = self.raw_request("POST", path, payload)
             self.assertEqual((status, parsed["error"]["code"]), (400, "invalid_request"), payload)
         status, parsed = self.raw_request("POST", path, b'{bad json')
         self.assertEqual((status, parsed["error"]["code"]), (400, "invalid_request"))
         status, parsed = self.raw_request("POST", path, b"{}", content_length="omit")
         self.assertEqual((status, parsed["error"]["code"]), (400, "invalid_request"))
-        # Nothing was admitted by the rejected requests.
+        # Nothing was admitted by the rejected requests (the window is still full at 3).
         _, state, _ = self.request("GET", "/v1/windows/h-3")
-        self.assertEqual((state["used"], state["remaining"]), (0, 3))
+        self.assertEqual((state["used"], state["remaining"]), (3, 0))
 
     def test_unknown_window_is_404(self) -> None:
         self.assertEqual(self.request("GET", "/v1/windows/ghost")[0], 404)
