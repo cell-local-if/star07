@@ -52,6 +52,13 @@ PYTHONPATH=src python3 -m unittest discover -s tests -v
 - 允许：`200 {"allowed": true, "remaining": <int 向下取整>, "capacity": <int>}`（并扣减令牌）。
 - 超限：**`429`** `{"error":{"code":"over_quota",...}}`，并带 **`Retry-After`**（秒，浮点；按当前 `refill_per_second` 计算并向上取整到毫秒，至少足够补足本次 `cost`，与 `POST /v1/reservations` 同一口径）。
 - 未配置的 key ⇒ `404 not_found`；`cost` 非法（含布尔值）⇒ `400 invalid_request`。
+- **不可满足的 cost**：key 已配置且合法 `cost` 大于该 key **当前** `capacity` 时，无论等待多久桶都不可能容纳
+  （令牌最多只补到 capacity），返回 **`400`** `{"error":{"code":"invalid_request",...}}`，`message` 说明
+  cost 超过 capacity；**不返回 200/429、不带 `Retry-After`**。该比较在配置临界区内、采样时钟**之前**完成，
+  故不推进高水位线、不结算到期预留、不补充令牌、不扣减 remaining、不写 used/账本，也不递增 check 的
+  allowed/over_quota 指标；每个请求只对应并发 PUT 更新前或更新后的单一 capacity，不读撕裂状态。
+  `cost == capacity` 不受影响（桶满即可通过）；未知 key 没有可比较的配置，其合法大 cost 仍是 `404 not_found`；
+  JSON/key/cost 格式错误仍按既有优先级先返回 `400`。此规则仅限 `POST /v1/check`，reservations 与层级接口不变。
 
 ### `POST /v1/hierarchies/check`
 面向**组织到租户**的层级即时扣减：复用 `PUT /v1/limits/{key}` 配置的既有令牌桶，不另建配置协议。

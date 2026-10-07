@@ -511,8 +511,20 @@ class Limiter:
         key = validate_key(key)
         cost = validate_cost(cost)
         with self._lock:
-            now = self._tick()
             limit = self.limit(key)
+            # A cost above the key's CURRENT capacity can never be admitted, however long the
+            # caller waits: the bucket refills only up to capacity, so a finite Retry-After would
+            # advertise an unsatisfiable request. The comparison reads the one configuration this
+            # critical section is pinned to — a concurrent PUT installs its Limit atomically under
+            # this same lock, so the request is judged wholly against either the old or the new
+            # capacity, never a torn mix. It runs (and rejects) before the clock is sampled: no
+            # watermark advance, expiry settle, refill, deduction, used, ledger or decision count.
+            # An unconfigured key stays 404: self.limit() raised before this point with nothing to
+            # compare against.
+            if cost > limit.capacity:
+                raise InvalidRequest(
+                    f"cost {cost} exceeds capacity {limit.capacity} for key {key!r}")
+            now = self._tick()
             self._expire_due(key, now)
             bucket = self._refill(key, now)
             if bucket.tokens >= cost:
