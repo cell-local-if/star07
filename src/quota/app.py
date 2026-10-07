@@ -246,13 +246,22 @@ class Limiter:
         limit = validate_limit(payload)
         with self._lock:
             now = self._tick()
-            # Reconfiguration starts with the same lazy expiry settle every other operation does;
-            # the release is credited against the bucket running under the old configuration.
-            self._expire_due(key, now)
+            if key not in self._limits:
+                self._limits[key] = limit
+                self._buckets[key] = Bucket(limit.capacity, now)
+                return limit
+            # Hot reconfiguration of a live bucket. The wait since the bucket's last effective
+            # moment is first refilled at the OLD rate (capped at the OLD capacity); only then is
+            # the new configuration installed, so the new rate governs nothing before this moment
+            # and a capacity increase never conjures a full bucket.
+            self._refill(key, now)
             self._limits[key] = limit
-            existing = self._buckets.get(key)
-            self._buckets[key] = Bucket(limit.capacity if existing is None else min(existing.tokens, limit.capacity),
-                                        now, existing.cost_history if existing else [])
+            # Due holds settle after the old-rate refill and are credited against the NEW capacity
+            # (their _refill calls are no-ops: updated_at is already this effective moment).
+            self._expire_due(key, now)
+            bucket = self._buckets[key]
+            bucket.tokens = min(float(limit.capacity), bucket.tokens)
+            bucket.updated_at = now
         return limit
 
     def limit(self, key: str) -> Limit:
