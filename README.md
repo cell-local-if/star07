@@ -91,6 +91,36 @@ PYTHONPATH=src python3 -m unittest discover -s tests -v
 - 重配同一 key 后确认：落账 `cost` 仍按预留创建时数值，`remaining`/`capacity` 采用新容量与补充速率的当前值。
 - 与 check/reserve/expire/rollback 共用同一把锁、同一套原子额度判断：不会超卖、退款后又落账或重复累计 `used`。
 
+### `POST /v1/hierarchies/reservations`
+**跨层预留**：对层级 `keys` 的每一层原子占用 `cost` 令牌（不记为已消耗、不写账本）。
+请求体：`{"keys": [<string>, ...], "cost": <int 1..1000000，缺省 1>, "ttl_seconds": <int 1..86400，缺省 60>}`，
+`keys`/`cost`/`ttl_seconds` 规则同 `POST /v1/hierarchies/check` 与 `POST /v1/reservations`。
+- 成功：`200 {"reservation_id": ..., "keys": [...], "cost": <int>, "ttl_seconds": <int>, "layers": [{"key": ..., "remaining": <int>, "capacity": <int>}, ...]}`，
+  `layers` 按 `keys` 输入顺序；每层立即扣减 `cost`（`remaining` 立即反映），但各层 `used` 不变、账本不追加。
+- 任一层不足：**整体拒绝**，各层不扣减、不落账 ⇒ `429 over_quota`；`Retry-After` 取所有不足层各自补齐
+  deficit 所需时间的**最大值**，沿用毫秒向上取整、三位小数格式。
+- 体含未知或缺失字段、`keys`/`cost`/`ttl_seconds` 非法 ⇒ `400 invalid_request`；结构合法但含未配置层
+  ⇒ `404 not_found`（`message` 指明输入顺序中第一个未配置的 key；`invalid_request` 先于 `not_found`）。
+- **惰性过期**：从创建时刻起经过单调时间 `ttl_seconds` 即失效（边界取大于等于）；重配任一层不延长有效期。
+  每个额度入口（check、层级 check、预留、跨层预留、状态读取、重配、consume、rollback）开始时，先结算已到期的
+  单层与跨层预留：每层只返还一次，先按时间补充再按该层当前 `capacity` 封顶。
+- 与单层预留**共享同一把锁、同一时钟高水位线**：不得部分占用、部分退款；时钟停住或回拨不提前退款、不补令牌。
+
+### `POST /v1/hierarchies/reservations/{reservation_id}/consume`
+把**尚未过期且未撤销**的跨层预留确认为实际消耗。请求体**必须是空 JSON 对象 `{}`**。
+- 命中时先对涉及的每层按既有规则结算到期预留，再确认：目标预留的 `cost` 不返还也不二次扣减，
+  每层账本追加一条 `source` 为 `"hierarchy_reservation_consume"`、`reservation_id` 为该标识的事件，`used` 按 `cost` 增加。
+- 成功：`200 {"reservation_id": ..., "consumed": true, "layers": [{"key": ..., "remaining": <int>, "capacity": <int>, "used": <int>}, ...]}`。
+- **幂等**：重复 consume 仍返回 `200`，JSON 与首次响应完全一致，不重复落账、不重复累计 `used`。
+- 未知、已过期、已撤销、已确认后交叉访问，或标识属于单层预留 ⇒ `404 not_found`；非空或非对象 consume 体
+  ⇒ `400 invalid_request`；路径段数不对或末段不是 `consume`、方法不匹配 ⇒ 先返回 `404 not_found` 且不读体。
+- 重配后确认：落账 `cost` 取创建时数值，`remaining`/`capacity` 取新配置当前值。
+
+### `DELETE /v1/hierarchies/reservations/{reservation_id}`
+对**尚未过期且未确认**的跨层预留执行**一次**撤销：把 `cost` 退回全部层，每层先按时间补充、再按当前 `capacity` 封顶。
+- 成功：`200 {"reservation_id": ..., "rolled_back": true, "layers": [{"key": ..., "remaining": <int>, "capacity": <int>}, ...]}`。
+- 重复撤销、未知标识、已过期、已确认（已确认不退款）、标识属于单层预留、路径或方法不匹配 ⇒ `404 not_found`。
+
 ### `GET /v1/limits/{key}`
 `200 {"limit": {...}, "remaining": <int>, "used": <int>}`（读取也会先按时间补充，体现当前余量；未确认的预留不计入 `used`）。
 
@@ -99,8 +129,9 @@ PYTHONPATH=src python3 -m unittest discover -s tests -v
 - 查询参数（可选）：`events=<int 1..1000>`，按 `seq` 升序返回最近的若干条事件；缺省 `100`。
 - 成功：`200 {"key": ..., "totals": {"accepted_count": <int>, "accepted_cost": <int>}, "events": [...]}`。
   `totals.accepted_cost` 恒等于同一状态下 `GET /v1/limits/{key}` 的 `used`；`accepted_count` 为事件总数（不受 `events` 窗口影响）。
-- 每条事件固定为 `{"seq": <int 从 1 起每 key 连续递增>, "source": "check"|"hierarchy_check"|"reservation_consume", "reservation_id": <string|null>, "cost": <int>, "remaining": <int>, "capacity": <int>, "effective_at": <float>}`：
-  - 成功的 `check`、成功的层级 `hierarchies/check`（每层一条）与成功的（首次）consume 各生成且只生成一条；`check` 事件的 `reservation_id` 为 `null`，
+- 每条事件固定为 `{"seq": <int 从 1 起每 key 连续递增>, "source": "check"|"hierarchy_check"|"reservation_consume"|"hierarchy_reservation_consume", "reservation_id": <string|null>, "cost": <int>, "remaining": <int>, "capacity": <int>, "effective_at": <float>}`：
+  - 成功的 `check`、成功的层级 `hierarchies/check`（每层一条）、成功的（首次）consume 与成功的（首次）跨层 consume
+    （每层一条）各生成且只生成一条；`check` 事件的 `reservation_id` 为 `null`，
     consume 事件使用原预留标识。重复 consume 幂等重放、不追加；令牌不足、回滚、过期结算与各类校验失败均不生成事件。
   - `cost` 为实际记账数；`remaining`/`capacity` 取记账完成临界区内的数值；`effective_at` 为产生该事件的公开操作
     在同一临界区内采样的有效时刻（高水位线口径）。
