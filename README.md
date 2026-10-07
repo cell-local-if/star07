@@ -165,6 +165,22 @@ PYTHONPATH=src python3 -m unittest discover -s tests -v
 - 未知窗口 ⇒ `404 not_found`；路径段数不对、末段不是 `check` 或方法不匹配 ⇒ **先**返回 `404 not_found`
   且不读请求体。
 
+### `GET /v1/metrics`
+**只读累计决策观测**：返回进程内 Limiter 创建以来五类决策的累计次数（进程内存，重启归零，无持久化承诺）。
+- 成功：`200 {"metrics":{"decisions":{"check":{"allowed":<int>,"over_quota":<int>},"hierarchy_check":{...},"reservation":{...},"hierarchy_reservation":{...},"window_check":{...}}}}`；
+  五类依次覆盖**单键即时检查**（`POST /v1/check`）、**层级即时检查**（`POST /v1/hierarchies/check`）、
+  **单键预留创建**（`POST /v1/reservations`）、**跨层预留创建**（`POST /v1/hierarchies/reservations`）和
+  **滑动窗口检查**（`POST /v1/windows/{key}/check`）。
+- 一次成功决策给对应类别的 `allowed` 加一；一次因额度或窗口不足返回 **429** 的决策给该类别的 `over_quota` 加一。
+  层级请求按**整个请求**计一次，不按层数计多次。
+- **不增加指标**的情形：预留的 consume、rollback、过期惰性结算；各类既有 GET 读取
+  （`/v1/limits`、`/v1/ledgers`、`/v1/windows` 以及本端点自身）；参数/请求体校验失败（`400`）；
+  未配置 key 的 `404`；未知路由与错误方法（`404`）。既有错误码与错误优先级不变。
+- 本端点**只在锁内复制计数**：不采样时钟、不推进高水位线、不结算预留、不补充令牌、不修改账本或窗口历史；
+  时钟停住或回拨时重复读取结果完全一致。并发决策的加一在同一把锁内串行，不丢失也不重复。
+- **不带任何查询参数**：带任意查询参数 ⇒ `400 invalid_request`（末尾裸 `?` 且查询串为空视为无参数）；
+  路径多段、少段或方法不是 GET ⇒ `404 not_found`；错误路径与错误方法不读取请求体。
+
 ### `GET /v1/windows/{key}`
 返回 check 同一有效时刻下的同一快照：`200 {"window": {...}, "used": <int>, "remaining": <int>}`
 （先淘汰窗外事件再计数；未知窗口 ⇒ `404 not_found`）。
