@@ -208,17 +208,17 @@ PYTHONPATH=src python3 -m unittest discover -s tests -v
 `{"cost": <int 1..1000000>}`。`cost` 规则与 `POST /v1/check` 相同（非布尔整数，缺省 1；
 布尔值、浮点数、0、超出范围均非法）。空对象仍等价于 `{"cost": 1}`，响应字段不增加。
 - 每次成功检查登记一个**加权占用** `(effective_at, cost)`，窗口占用量 `used` 为所有**存活占用的 cost 总和**
-  （不再是条目数）。成功检查在**一次原子判定**中先淘汰所有满足
-  `effective_at + window_seconds <= 当前有效时刻` 的旧占用——**边界取大于等于，恰在淘汰边界的历史占用先离开，
+  加上**有效窗口预留的 cost 总和**（预留见下文 `POST /v1/windows/{key}/reservations`）。成功检查在**一次原子判定**中先淘汰所有满足
+  `effective_at + window_seconds <= 当前有效时刻` 的旧占用、并释放已到期的窗口预留——**边界取大于等于，恰在淘汰边界的历史占用先离开，
   同一时刻的占用作为一批一起释放**——然后才判断：淘汰后的 `used + cost <= max_events` 时把本次 cost
   作为当前有效时刻的占用计入，返回
   `200 {"allowed": true, "used": <int>, "remaining": <int>, "limit": <int>, "window_seconds": <int>}`；
   `used` 含本次，`remaining = max_events - used`，`limit = max_events`。
 - 放不下（`used + cost > max_events`）：本次 **cost 不进入历史**，返回 **`429`**
-  `{"error":{"code":"over_quota",...}}` 并带 **`Retry-After`**——等待**最早一批**旧占用过期、且该批离开后
-  **累计释放的 cost 首次足以容纳本次请求**的边界时刻（从最旧的存活占用起按同一时刻分批累计，
-  取第一个使 `used - 累计释放 + cost <= max_events` 的批次，等待秒数为
-  `该批时刻 + window_seconds - 当前有效时刻`）；同一时刻的占用一起释放。格式与令牌桶 429 同一口径：
+  `{"error":{"code":"over_quota",...}}` 并带 **`Retry-After`**——等待**最早一批**旧占用过期或有效预留释放、
+  且该批离开后**累计释放的 cost 首次足以容纳本次请求**的边界时刻（事件与预留在同一条释放时间线上，
+  从最旧的存活占用/预留起按同一时刻分批累计，取第一个使 `used - 累计释放 + cost <= max_events` 的批次，
+  等待秒数为 `该批释放时刻 - 当前有效时刻`）；同一时刻的占用一起释放。格式与令牌桶 429 同一口径：
   按毫秒**向上取整**、保留三位小数（亚毫秒也给 `0.001`，永不为 `0.000`）；被拒请求不计入占用。
 - 已配置窗口的**合法 `cost` 大于当前 `max_events`** 时该请求永远不可能放入 ⇒ **`400 invalid_request`**
   （`message` 说明 cost 超过 max_events），不返回 200/429、不带 `Retry-After`；该判断与并发 PUT 在同一临界区内
@@ -233,8 +233,48 @@ PYTHONPATH=src python3 -m unittest discover -s tests -v
 
 ### `GET /v1/windows/{key}`
 返回 check 同一有效时刻下的同一快照：`200 {"window": {...}, "used": <int>, "remaining": <int>}`
-（先淘汰窗外占用再计数；`used` 为存活占用的 **cost 总和**，`remaining = max_events - used`；
-未知窗口 ⇒ `404 not_found`）。
+（先淘汰窗外占用再计数；`used` 为存活占用的 **cost 总和**加上**有效窗口预留**的 cost 总和，
+`remaining = max_events - used`；未知窗口 ⇒ `404 not_found`）。
+
+### `POST /v1/windows/{key}/reservations`
+**窗口容量预留**：在滑动窗口内占用 `cost` 额度但不形成事件。请求体只接受
+`{}`、`{"cost": <int 1..1000000，缺省 1>}`、`{"ttl_seconds": <int 1..86400，缺省 60>}` 或二者
+（非对象、未知字段、非法 cost/ttl、畸形 JSON、缺 `Content-Length` ⇒ `400 invalid_request`，均在进入锁之前拒绝）。
+- 成功：`200 {"reservation_id": <进程内唯一的不透明字符串>, "key": ..., "cost": <int>, "ttl_seconds": <int>,
+  "used": <int>, "remaining": <int>, "limit": <int>, "window_seconds": <int>}`；
+  预留**立即计入** `used` 与 `remaining`，后续窗口检查与状态读取都把有效预留视为容量占用。
+- 与窗口检查**共用同一临界区与同一次时钟采样**：先淘汰窗外占用并释放到期预留，再判断
+  `used + cost <= max_events`；判断口径、边界（大于等于）与同刻批量语义与窗口检查完全一致。
+- **自动过期（惰性、确定）**：预留在 `created_at + ttl_seconds` 释放（边界取大于等于），释放**不形成事件**；
+  重配窗口（含缩短 `window_seconds`、降低 `max_events`）**不延长** TTL，也不撤销已有占用。
+- 容量不足 ⇒ **`429`** `{"error":{"code":"over_quota",...}}` 并带 **`Retry-After`**：等待**最早一批**
+  过期事件**或有效预留**释放后刚好容纳本次 `cost` 的时刻（事件与预留在同一条释放时间线上按同一时刻分批累计，
+  取第一个使 `used - 累计释放 + cost <= max_events` 的批次，等待秒数为 `该批释放时刻 - 当前有效时刻`），
+  按现有毫秒向上取整规则、保留三位小数；被拒请求不占用容量。
+- 已配置窗口的合法 `cost` **大于当前 `max_events`** ⇒ **`400 invalid_request`**（`message` 说明 cost 超过
+  max_events），不返回 200/429、不带 `Retry-After`；该判断与并发 PUT 在同一临界区内读取单一配置快照，
+  且在**采样时钟之前**返回——不推进水位线、不淘汰占用、不释放预留、不改变 used。`cost` 等于 `max_events`
+  仍是合法请求。未知窗口 ⇒ `404 not_found`（不创建窗口）；非法 key ⇒ `400 invalid_request`（格式校验先于查找）。
+- 窗口预留**不写账本、不改变 revision 或 ETag、不计入 `GET /v1/metrics` 的任何计数**（metrics 形状保持五类不变）。
+
+### `DELETE /v1/windows/{key}/reservations/{reservation_id}`
+撤销一个**未过期**的窗口预留：其 `cost` 立即不再计入占用（释放不形成事件）。
+- 成功：`200 {"key": ..., "cost": <int>, "rolled_back": true, "used": <int>, "remaining": <int>,
+  "limit": <int>, "window_seconds": <int>}`，`used`/`remaining` 为释放后的当前值。
+- 重复撤销、未知标识、**跨 key** 的预留、已过期、已确认的预留，以及把令牌桶/层级预留标识用到本路由
+  ⇒ `404 not_found`；未知窗口 ⇒ `404 not_found`；路径段数不对或方法不匹配 ⇒ 先 `404` 且不读体。
+
+### `POST /v1/windows/{key}/reservations/{reservation_id}/consume`
+把一个**未过期**的窗口预留确认为普通占用。请求体**必须是空 JSON 对象 `{}`**。
+- 命中时先按既有规则淘汰窗外占用并释放到期预留，再确认：预留在**同一有效时刻**转成一条普通占用
+  （`effective_at` 为本次操作的有效时刻），此后按 `window_seconds` 滑出窗口；转换**不重新判断容量**
+  （该 cost 本就在占用窗口），`used` 与 `remaining` 不因转换本身改变。
+- 成功：`200 {"key": ..., "cost": <int>, "consumed": true, "used": <int>, "remaining": <int>,
+  "limit": <int>, "window_seconds": <int>}`。
+- **幂等**：重复 consume 仍返回 `200`，JSON 字段值与首次响应完全一致，不再产生占用。
+- 未知标识、**跨 key** 的预留、已过期、已撤销的预留，以及把令牌桶/层级预留标识用到本路由 ⇒ `404 not_found`；
+  未知窗口 ⇒ `404 not_found`；过期后的 consume 不再产生任何占用。
+- 窗口预留的创建、回滚、consume 与过期释放均**不写账本、不计 metrics、不改变 revision/ETag**。
 
 ### `GET /v1/metrics`
 **只读累计决策观测**：返回本进程内 Limiter 创建以来五类额度决策的累计次数，形状固定为
@@ -244,7 +284,7 @@ PYTHONPATH=src python3 -m unittest discover -s tests -v
   滑动窗口检查（`POST /v1/windows/{key}/check`）。
 - 一次成功决策计一次 `allowed`；一次因额度或窗口不足返回 `429` 的决策计一次 `over_quota`。
   层级请求**按整个请求计一次**，不按层数累计。
-- 预留的 consume、rollback、过期结算与所有 GET 读取**不计数**；参数校验失败（`400`）、
+- 预留的 consume、rollback、过期结算与所有 GET 读取**不计数**；窗口预留的创建、回滚、consume 与过期释放同样**不计数**；参数校验失败（`400`）、
   未配置 key 的 `404`、未知路由与错误方法也**不计数**。
 - 计数在同一把锁内随决策精确加一：并发下不丢失、不重复。
 - 读取**只加锁拷贝计数**：不采样时钟、不推进高水位线、不结算预留、不补充令牌、不改账本或窗口历史，
@@ -265,6 +305,8 @@ PYTHONPATH=src python3 -m unittest discover -s tests -v
 - 窗口只存进程内存，与同名令牌桶 key **相互隔离**：`PUT /v1/windows/k` 不创建 `/v1/limits/k`，反之亦然。
 - 窗口准入**不进入** `GET /v1/limits/{key}` 的 `used`，也不写入 `/v1/ledgers/{key}` 账本；令牌桶的
   check、配置、预留、consume、rollback、状态与账本的公开行为完全不变。
+- 窗口预留在**独立命名空间**：其 `reservation_id` 不能用于令牌桶/层级预留的 rollback 与 consume（反之亦然，
+  交叉访问一律 `404 not_found`），其创建、回滚、consume 与过期释放不写账本、不计 metrics、不改变 revision/ETag。
 
 ### `PUT /v1/leaky-buckets/{key}`
 与令牌桶、窗口**彼此独立**的漏桶：水随时间以固定速率漏出，注入的请求抬高水位，水位加本次 cost
