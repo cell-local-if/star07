@@ -996,6 +996,87 @@ class Limiter:
                 "events": [event.as_json() for event in events[-event_limit:]],
             }
 
+    def reconciliation(self, key: Any) -> dict[str, Any]:
+        """Cross-check one key's booked usage against its ledger, event detail and live holds.
+
+        Unlike ledger() this entry DOES sample the clock: inside the one critical section the
+        clock is sampled exactly once (clamped to the watermark, so a stalled or regressed clock
+        settles nothing early or late), every due reservation touching the key — single-key and
+        cross-layer alike — is settled at that effective moment with the inclusive boundary, and
+        the whole snapshot is then read from that same settled state. The settle only releases
+        tokens: it books no used, no ledger event and no decision count, exactly as at every
+        other entry point. Nothing here ever writes history back: a mismatch is reported, not
+        repaired.
+
+        `used` is the bucket's cumulative accepted spend; the ledger totals are the lifetime
+        accepted_count/accepted_cost. The retained detail is the bounded readable tail, the
+        trimmed detail is the cumulative difference (accepted minus retained), and together they
+        cover the accepted totals by construction. `reconciled` is true exactly when used equals
+        accepted_cost, retained plus trimmed match the accepted totals in count and in cost, and
+        the retained seqs are one contiguous run ending at accepted_count (an empty ledger with
+        no bookings at all is trivially consistent). Any drift — used vs ledger cost, a trimmed
+        surplus or deficit, a seq gap, a hierarchy hold counted twice — still returns 200 with
+        reconciled false and the raw figures; the caller decides what to do about it.
+        """
+        key = validate_key(key)
+        with self._lock:
+            if key not in self._limits:
+                # The 404 creates nothing and does not even sample the clock: an unknown key
+                # leaves the watermark and every other piece of state exactly as it was.
+                raise LimitNotFound(f"no limit configured for {key!r}")
+            now = self._tick()
+            self._expire_due(key, now)
+            used = self._buckets[key].used
+            ledger = self._ledgers.get(key)
+            accepted_count = ledger.accepted_count if ledger is not None else 0
+            accepted_cost = ledger.accepted_cost if ledger is not None else 0
+            events = list(ledger.events) if ledger is not None else []
+            retained_count = len(events)
+            retained_cost = sum(event.cost for event in events)
+            trimmed_count = accepted_count - retained_count
+            trimmed_cost = accepted_cost - retained_cost
+            first_seq = events[0].seq if events else None
+            last_seq = events[-1].seq if events else None
+            # Live holds touching this key, after the settle above: each cross-layer hold counts
+            # its cost exactly once however many layers it spans.
+            single_key_holds = [reservation for reservation in self._reservations.values()
+                                if reservation.key == key and not reservation.rolled_back]
+            hierarchy_holds = [reservation for reservation in self._hierarchy_reservations.values()
+                               if key in reservation.keys]
+            active_cost = (sum(reservation.cost for reservation in single_key_holds)
+                           + sum(reservation.cost for reservation in hierarchy_holds))
+            if events:
+                seq_ok = last_seq == accepted_count and all(
+                    event.seq == first_seq + index for index, event in enumerate(events))
+            else:
+                # No retained detail: consistent only when nothing was ever booked (the trimmed
+                # side then covers nothing either). A booked-but-fully-unreadable ledger is a
+                # broken chain, not a clean one.
+                seq_ok = accepted_count == 0
+            reconciled = (used == accepted_cost
+                          and trimmed_count >= 0 and trimmed_cost >= 0
+                          and retained_count + trimmed_count == accepted_count
+                          and retained_cost + trimmed_cost == accepted_cost
+                          and seq_ok)
+            return {
+                "key": key,
+                "reconciled": reconciled,
+                "usage": {"used": used,
+                          "ledger_accepted_count": accepted_count,
+                          "ledger_accepted_cost": accepted_cost,
+                          "used_minus_ledger_cost": used - accepted_cost},
+                "holds": {"active_count": len(single_key_holds) + len(hierarchy_holds),
+                          "active_cost": active_cost,
+                          "single_key_count": len(single_key_holds),
+                          "hierarchy_count": len(hierarchy_holds)},
+                "events": {"retained_count": retained_count,
+                           "retained_cost": retained_cost,
+                           "trimmed_count": trimmed_count,
+                           "trimmed_cost": trimmed_cost,
+                           "first_seq": first_seq,
+                           "last_seq": last_seq},
+            }
+
     def _expire_window(self, window: SlidingWindow, now: float) -> None:
         """Drop every window admission whose age has reached window_seconds at this effective moment.
 
@@ -1496,6 +1577,15 @@ def make_handler(limiter: Limiter) -> type[BaseHTTPRequestHandler]:
                     # validation precedes quota classification everywhere else.
                     event_limit = self._ledger_event_limit()
                     return self._send(200, limiter.ledger(parts[2], event_limit))
+                if len(parts) == 4 and parts[:2] == ["v1", "ledgers"] and parts[3] == "reconciliation":
+                    # Like /v1/metrics this route names no query parameters and reads no body:
+                    # any query string is invalid_request, decided before the limiter call (and
+                    # hence before the clock is sampled or any state could change). The response
+                    # carries no ETag — reconciliation observes no configuration revision.
+                    if self._query_string() != "":
+                        raise InvalidRequest(
+                            "GET /v1/ledgers/{key}/reconciliation takes no query parameters")
+                    return self._send(200, limiter.reconciliation(parts[2]))
                 if len(parts) == 3 and parts[:2] == ["v1", "windows"]:
                     return self._send(200, limiter.window_state(parts[2]))
                 if len(parts) == 3 and parts[:2] == ["v1", "leaky-buckets"]:

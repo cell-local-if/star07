@@ -193,6 +193,32 @@ PYTHONPATH=src python3 -m unittest discover -s tests -v
 - 未配置的 key ⇒ `404 not_found`；`events` 不是 1..1000 内的整数字面量、参数重复或出现任何未知查询参数
   ⇒ `400 invalid_request`（查询校验先于 key 的 404）；路径段数不对或方法不匹配 ⇒ `404 not_found`。
 
+### `GET /v1/ledgers/{key}/reconciliation`
+**只读对账报告**：核对该令牌桶 key 的已入账用量、账本合计、明细覆盖与未确认预留。**不接受任何查询参数，
+也不读取请求体**；响应**不带 ETag**。
+- 入口在锁内**只采样一次时钟**（高水位线口径），按**包含边界**（`created_at + ttl_seconds <= now`）结算
+  触及该 key 的到期预留（单键与跨层）后，从同一已结算状态取整张快照；结算**只释放令牌**——不增加
+  `used`、不落账、不计 metrics，与其他入口的到期结算语义完全一致。报告**只读不写**：发现不一致时
+  如实报告差额，**不回补历史**。
+- 成功：`200 {"key": ..., "reconciled": <bool>, "usage": {...}, "holds": {...}, "events": {...}}`，
+  顶层只有这五个字段：
+  - `usage`：`{"used": <int>, "ledger_accepted_count": <int>, "ledger_accepted_cost": <int>,
+    "used_minus_ledger_cost": <int>}`——桶的累计已入账用量与账本全生命周期合计及其差值。
+  - `holds`：`{"active_count": <int>, "active_cost": <int>, "single_key_count": <int>,
+    "hierarchy_count": <int>}`——结算后仍存活、触及该 key 的预留；每个跨层预留的 `cost`
+    对该 key **只计一次**（无论它横跨多少层）。
+  - `events`：`{"retained_count": <int>, "retained_cost": <int>, "trimmed_count": <int>,
+    "trimmed_cost": <int>, "first_seq": <int|null>, "last_seq": <int|null>}`——`retained` 是可读明细
+    （有界尾部），`trimmed` 是累计裁剪明细（accepted 合计 − retained），两者合计覆盖 accepted 总量；
+    明细为空时 `first_seq`/`last_seq` 为 `null`。
+- `reconciled` 为 `true` 当且仅当：`used == ledger_accepted_cost`、retained 与 trimmed 的数量和 cost
+  分别合计等于 accepted 总量、且保留明细的 `seq` 连续并满足 `last_seq == ledger_accepted_count`
+  （从未记账的空账本视为一致）。否则仍返回 `200` 与 `reconciled: false` 及各项原始数值与差额。
+- 非法 key 或任何查询参数 ⇒ `400 invalid_request`，且不改变任何状态（不采样时钟、不结算、不推进水位线）；
+  未配置的 key ⇒ `404 not_found`，不创建任何对象（也不采样时钟）；路径段数不对、末段不是
+  `reconciliation` 或方法不匹配 ⇒ `404 not_found`。窗口与漏桶的状态**不进入**核对。
+
+
 ### `PUT /v1/windows/{key}`
 与令牌桶**彼此独立**的精确滑动窗口限流：创建或更新窗口。请求体只接受
 `{"window_seconds": <int 1..3600>, "max_events": <int 1..1000000>}`（两者均须为非布尔整数，不允许缺省、
