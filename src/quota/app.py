@@ -8,6 +8,7 @@ import json
 import math
 import threading
 import uuid
+from collections import deque
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable
@@ -72,7 +73,11 @@ class ConfigureResult:
 class Bucket:
     tokens: float
     updated_at: float
-    cost_history: list[float] = field(default_factory=list)
+    # Lifetime accepted spend booked to this key (instant checks, hierarchy checks, first
+    # consumes): a running total, not a per-event history, so a hot key's memory stays O(1)
+    # however long it lives. Updated only together with the key's ledger totals, inside the
+    # same critical section as the booking, so `used` and totals.accepted_cost never diverge.
+    used: int = 0
 
 
 @dataclass(frozen=True)
@@ -92,6 +97,28 @@ class LedgerEvent:
         return {"seq": self.seq, "source": self.source, "reservation_id": self.reservation_id,
                 "cost": self.cost, "remaining": self.remaining, "capacity": self.capacity,
                 "effective_at": self.effective_at}
+
+
+# How many event details each key's ledger retains: the newest 1000. The lifetime totals are
+# NOT bounded by this — they cover every accepted booking since the Limiter was created.
+LEDGER_EVENT_RETENTION = 1000
+
+
+@dataclass
+class Ledger:
+    """One key's bounded billing ledger: lifetime running totals plus a capped detail tail.
+
+    accepted_count/accepted_cost accumulate every accepted booking since the Limiter was
+    created and are the very numbers GET /v1/limits/{key}'s `used` is kept in lockstep with;
+    only the event DETAILS are bounded. seq is the lifetime event count, so once details are
+    dropped the retained tail starts above 1 — but it is always exactly the newest events,
+    dense and gap-free, with no duplicates and no resurrected old entries.
+    """
+
+    events: deque[LedgerEvent] = field(
+        default_factory=lambda: deque(maxlen=LEDGER_EVENT_RETENTION))
+    accepted_count: int = 0
+    accepted_cost: int = 0
 
 
 @dataclass
@@ -394,10 +421,12 @@ class Limiter:
         # versa (cross-resource identifiers are 404, not confusion).
         self._hierarchy_reservations: dict[str, HierarchyReservation] = {}
         self._hierarchy_consumed: dict[str, dict[str, Any]] = {}
-        # Append-only billing ledger per key: one entry per accepted check and per first consume.
-        # Entries are appended inside the lock at booking time, so seq is dense and gap-free even
-        # under concurrent settling; the list is never trimmed (read-only views take a tail slice).
-        self._ledgers: dict[str, list[LedgerEvent]] = {}
+        # Bounded billing ledger per key: lifetime accepted_count/accepted_cost plus the newest
+        # LEDGER_EVENT_RETENTION event details. Events are appended inside the lock at booking
+        # time, so seq (the lifetime count) is dense and gap-free even under concurrent settling;
+        # the capped deque drops only the oldest details, never the totals, so a long-lived hot
+        # key's ledger memory stays O(1) while totals and `used` still cover all of history.
+        self._ledgers: dict[str, Ledger] = {}
         # Independent sliding windows, keyed in their own namespace: a window named like a bucket
         # shares neither history nor accounting with it, and window admissions never touch a ledger.
         self._windows: dict[str, SlidingWindow] = {}
@@ -501,7 +530,7 @@ class Limiter:
             self._expire_due(key, now)
             bucket = self._refill(key, now)
             body = {"limit": limit.as_json(), "remaining": int(bucket.tokens),
-                    "used": sum(bucket.cost_history)}
+                    "used": bucket.used}
             return body, self._revisions[key]
 
     def state(self, key: str) -> dict[str, Any]:
@@ -553,15 +582,19 @@ class Limiter:
 
     def _record_event(self, key: str, source: str, cost: int, reservation_id: str | None,
                       remaining: float, capacity: int, effective_at: float) -> None:
-        """Append one accepted spend to the key's ledger. Caller holds the lock, booking just happened.
+        """Append one accepted spend to the key's bounded ledger. Caller holds the lock, booking just happened.
 
-        The new seq is len+1 computed inside the same critical section as the booking, so concurrent
-        bookings can neither skip nor reuse a number; totals derived from these entries therefore
-        never under- or over-count.
+        The lifetime totals and the new seq (the lifetime event count) advance inside the same
+        critical section as the booking, so concurrent bookings can neither skip nor reuse a
+        number and totals never under- or over-count. Only the newest LEDGER_EVENT_RETENTION
+        details are kept: the capped deque drops the oldest entry itself, so the retained tail
+        is always the newest events with consecutive seqs — totals are never trimmed.
         """
-        events = self._ledgers.setdefault(key, [])
-        events.append(LedgerEvent(len(events) + 1, source, reservation_id, cost,
-                                  int(remaining), capacity, effective_at))
+        ledger = self._ledgers.setdefault(key, Ledger())
+        ledger.accepted_count += 1
+        ledger.accepted_cost += cost
+        ledger.events.append(LedgerEvent(ledger.accepted_count, source, reservation_id, cost,
+                                         int(remaining), capacity, effective_at))
 
     def check(self, key: Any, cost: Any) -> dict[str, Any]:
         # Same key rule as configure/reserve, enforced before the lock: a rejected check
@@ -587,7 +620,7 @@ class Limiter:
             bucket = self._refill(key, now)
             if bucket.tokens >= cost:
                 bucket.tokens -= cost
-                bucket.cost_history.append(cost)
+                bucket.used += cost
                 self._record_event(key, "check", cost, None, bucket.tokens, limit.capacity, now)
                 self._record_decision("check", "allowed")
                 return {"allowed": True, "remaining": int(bucket.tokens), "capacity": limit.capacity}
@@ -648,7 +681,7 @@ class Limiter:
             layers = []
             for key, bucket in zip(keys, buckets):
                 bucket.tokens -= cost
-                bucket.cost_history.append(cost)
+                bucket.used += cost
                 limit = self._limits[key]
                 self._record_event(key, "hierarchy_check", cost, None, bucket.tokens, limit.capacity, now)
                 layers.append({"key": key, "remaining": int(bucket.tokens), "capacity": limit.capacity})
@@ -833,12 +866,12 @@ class Limiter:
                 raise LimitNotFound(f"no consumable reservation {reservation_id!r}")
             limit = self._limits[key]
             bucket = self._refill(key, now)
-            bucket.cost_history.append(reservation.cost)
+            bucket.used += reservation.cost
             self._record_event(key, "reservation_consume", reservation.cost, reservation_id,
                                bucket.tokens, limit.capacity, now)
             snapshot = {"reservation_id": reservation_id, "consumed": True,
                         "remaining": int(bucket.tokens), "capacity": limit.capacity,
-                        "used": sum(bucket.cost_history)}
+                        "used": bucket.used}
             self._consumed[reservation_id] = snapshot
             return dict(snapshot)
 
@@ -897,7 +930,7 @@ class Limiter:
             for key in reservation.keys:
                 limit = self._limits[key]
                 bucket = self._refill(key, now)
-                bucket.cost_history.append(reservation.cost)
+                bucket.used += reservation.cost
                 self._record_event(key, "hierarchy_reservation_consume", reservation.cost,
                                    reservation_id, bucket.tokens, limit.capacity, now)
                 layers.append({"key": key, "remaining": int(bucket.tokens), "capacity": limit.capacity})
@@ -913,16 +946,22 @@ class Limiter:
         cannot cause early refunds or late postings through this entry point. Only the lock is taken
         so the copy is consistent with concurrent check/reserve/consume/rollback/expiry work.
         `event_limit` is assumed pre-validated as an int in 1..1000; the returned tail is ordered by
-        seq ascending while totals always cover the full append-only history.
+        seq ascending and is exactly the newest retained events (seq may start above 1 once details
+        older than LEDGER_EVENT_RETENTION have been dropped), while totals always cover the full
+        lifetime history.
         """
         with self._lock:
             if key not in self._limits:
                 raise LimitNotFound(f"no limit configured for {key!r}")
-            events = self._ledgers.get(key, [])
+            ledger = self._ledgers.get(key)
+            if ledger is None:
+                return {"key": key,
+                        "totals": {"accepted_count": 0, "accepted_cost": 0}, "events": []}
+            events = list(ledger.events)
             return {
                 "key": key,
-                "totals": {"accepted_count": len(events),
-                           "accepted_cost": sum(event.cost for event in events)},
+                "totals": {"accepted_count": ledger.accepted_count,
+                           "accepted_cost": ledger.accepted_cost},
                 "events": [event.as_json() for event in events[-event_limit:]],
             }
 
