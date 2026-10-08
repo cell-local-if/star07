@@ -28,7 +28,7 @@ PYTHONPATH=src python3 -m unittest discover -s tests -v
 `200 {"status":"ok"}`
 
 ### `PUT /v1/limits/{key}`
-请求体：`{"capacity": <int 1..1000000>, "refill_per_second": <number > 0>}` → `200 {"key": ..., "limit": {...}}`
+请求体：`{"capacity": <int 1..1000000>, "refill_per_second": <有限 number，0 < rate ≤ 1000000>}` → `200 {"key": ..., "limit": {...}}`
 - **配置版本 revision 与 ETag**：每个 key 第一次成功创建时 revision 为 **1**，此后每次成功 PUT 都 **+1**
   （即使新旧配置完全相同也递增）。成功 PUT 与 `GET /v1/limits/{key}` 的响应都带头
   **`ETag: "<revision>"`**（双引号包裹的当前 revision 十进制字符串，如 `ETag: "3"`）。响应 JSON 的字段与
@@ -45,7 +45,9 @@ PYTHONPATH=src python3 -m unittest discover -s tests -v
   之间的等待补足（按旧 capacity 封顶），再按**新** capacity 封顶（即 `min(旧速率补足后的令牌, 新 capacity)`）；
   容量扩大不会把桶补满，新速率也不追溯作用于重配前的等待。重配开始时已到期的预留在同一临界区内按
   "先旧速率补充、再返还各自 cost、最后以新 capacity 封顶"的顺序结算；未到期预留继续占用。
-- 未知字段/非法值 ⇒ `400 invalid_request`。
+- 未知字段/非法值 ⇒ `400 invalid_request`。`refill_per_second` 只接受大于 0 且不超过 1000000 的**有限**数字
+  （整数与有限浮点数合法；布尔值、`NaN`、`Infinity`、`-Infinity` 及超出范围的值一律 `400 invalid_request`，
+  消息说明它必须是有限正数且不超过 1000000）。
 
 ### `POST /v1/check`
 请求体：`{"key": <string>, "cost": <int 1..1000000，缺省 1>}`

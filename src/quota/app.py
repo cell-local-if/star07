@@ -307,8 +307,19 @@ def validate_limit(payload: Any) -> Limit:
     capacity, rate = payload.get("capacity"), payload.get("refill_per_second")
     if not isinstance(capacity, int) or isinstance(capacity, bool) or capacity < 1 or capacity > 1_000_000:
         raise InvalidRequest("capacity must be an integer between 1 and 1000000")
-    if not isinstance(rate, (int, float)) or isinstance(rate, bool) or rate <= 0 or rate > 1_000_000:
-        raise InvalidRequest("refill_per_second must be a positive number")
+    if not isinstance(rate, (int, float)) or isinstance(rate, bool):
+        raise InvalidRequest(
+            "refill_per_second must be a finite positive number no greater than 1000000")
+    # Python's JSON parser accepts the non-standard NaN/Infinity literals; neither is a usable
+    # rate, and a NaN rate would poison every later Retry-After computation with a non-finite
+    # value. Like every body validator this runs before the lock, so a rejected PUT creates or
+    # replaces nothing and never advances the clock watermark.
+    if isinstance(rate, float) and (math.isnan(rate) or math.isinf(rate)):
+        raise InvalidRequest(
+            "refill_per_second must be a finite positive number no greater than 1000000")
+    if not 0 < rate <= 1_000_000:
+        raise InvalidRequest(
+            "refill_per_second must be a finite positive number no greater than 1000000")
     return Limit(int(capacity), float(rate))
 
 
