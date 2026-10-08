@@ -178,8 +178,11 @@ PYTHONPATH=src python3 -m unittest discover -s tests -v
 ### `GET /v1/ledgers/{key}`
 **只读配额账本**，供计费对账：给出形成了实际消耗的每一笔事件，以及与 `GET /v1/limits/{key}` 的 `used` 完全一致的合计。
 - 查询参数（可选）：`events=<int 1..1000>`，按 `seq` 升序返回最近的若干条事件；缺省 `100`。
+- 事件明细为有界保存：每个 key 至多保留最近 1000 条。历史超过 1000 条时，返回的事件 `seq` 从大于 1 开始，
+  但仍是连续递增、无跳号、无重复的最近尾部（首条 `seq` = `accepted_count` − 返回条数 + 1）。
 - 成功：`200 {"key": ..., "totals": {"accepted_count": <int>, "accepted_cost": <int>}, "events": [...]}`。
   `totals.accepted_cost` 恒等于同一状态下 `GET /v1/limits/{key}` 的 `used`；`accepted_count` 为事件总数（不受 `events` 窗口影响）。
+  两项合计均覆盖自 Limiter 创建以来的全部成功记账，不随明细裁剪而缩减。
 - 每条事件固定为 `{"seq": <int 从 1 起每 key 连续递增>, "source": "check"|"hierarchy_check"|"reservation_consume"|"hierarchy_reservation_consume", "reservation_id": <string|null>, "cost": <int>, "remaining": <int>, "capacity": <int>, "effective_at": <float>}`：
   - 成功的 `check`、成功的层级 `hierarchies/check`（每层一条）、成功的（首次）consume 与成功的（首次）跨层 consume（每层一条）各生成且只生成一条；`check` 事件的 `reservation_id` 为 `null`，
     consume 事件使用原预留标识。重复 consume 幂等重放、不追加；令牌不足、回滚、过期结算与各类校验失败均不生成事件。
