@@ -28,7 +28,13 @@ PYTHONPATH=src python3 -m unittest discover -s tests -v
 `200 {"status":"ok"}`
 
 ### `PUT /v1/limits/{key}`
-请求体：`{"capacity": <int 1..1000000>, "refill_per_second": <number > 0>}` → `200 {"key": ..., "limit": {...}}`
+请求体：`{"capacity": <int 1..1000000>, "refill_per_second": <number，有限、> 0 且 ≤ 1000000>}` → `200 {"key": ..., "limit": {...}}`
+- **`refill_per_second` 取值边界**：只接受非布尔、**有限**且严格大于 0、不超过 1000000 的数字；整数与有限浮点数均合法，
+  布尔值、`NaN`、`Infinity`、`-Infinity`、0、负数与超过 1000000 的值一律 `400 invalid_request`，
+  `message` 明确说明 refill_per_second 必须是有限正数且不超过 1000000。该校验对 `Limiter.configure` 与 HTTP PUT
+  同一口径（同为 `InvalidRequest`/400），且在进入锁之前完成：被拒绝的请求不创建或替换 key，revision 与 ETag 不变，
+  未配置 key 不会被创建，时钟水位线、tokens、used、预留、账本事件与决策指标均不改变；即使 `If-Match` 合法，配置值
+  含非有限数仍按 `invalid_request` 处理（不进入 `revision_conflict`，也不产生部分写入）。
 - **配置版本 revision 与 ETag**：每个 key 第一次成功创建时 revision 为 **1**，此后每次成功 PUT 都 **+1**
   （即使新旧配置完全相同也递增）。成功 PUT 与 `GET /v1/limits/{key}` 的响应都带头
   **`ETag: "<revision>"`**（双引号包裹的当前 revision 十进制字符串，如 `ETag: "3"`）。响应 JSON 的字段与

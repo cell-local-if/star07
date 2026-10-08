@@ -299,6 +299,17 @@ def validate_ttl(ttl: Any) -> int:
 
 
 def validate_limit(payload: Any) -> Limit:
+    """The sole accepted shape of a token-bucket configuration: exactly capacity and
+    refill_per_second, nothing optional or extra.
+
+    capacity is a non-boolean integer in 1..1000000; refill_per_second is a non-boolean,
+    FINITE number strictly greater than 0 and at most 1000000 (integers accepted, booleans
+    never — ``True`` must not sneak in as 1). Python's JSON parser accepts the non-standard
+    NaN/Infinity literals, and a non-finite rate would later make an over-quota Retry-After
+    non-finite, so NaN and either Infinity are rejected here alongside every other bad value.
+    Like every body validator this runs before the lock, so a rejected PUT creates no key,
+    changes no revision and never advances the clock watermark.
+    """
     if not isinstance(payload, dict):
         raise InvalidRequest("body must be a JSON object")
     extra = set(payload) - {"capacity", "refill_per_second"}
@@ -307,8 +318,18 @@ def validate_limit(payload: Any) -> Limit:
     capacity, rate = payload.get("capacity"), payload.get("refill_per_second")
     if not isinstance(capacity, int) or isinstance(capacity, bool) or capacity < 1 or capacity > 1_000_000:
         raise InvalidRequest("capacity must be an integer between 1 and 1000000")
-    if not isinstance(rate, (int, float)) or isinstance(rate, bool) or rate <= 0 or rate > 1_000_000:
-        raise InvalidRequest("refill_per_second must be a positive number")
+    if not isinstance(rate, (int, float)) or isinstance(rate, bool):
+        raise InvalidRequest(
+            "refill_per_second must be a finite positive number no greater than 1000000")
+    # NaN compares false against every bound (NaN <= 0 and NaN > 1000000 are both false), so
+    # finiteness must be tested explicitly; Infinity is caught by the range check below but is
+    # named by the same message.
+    if isinstance(rate, float) and (math.isnan(rate) or math.isinf(rate)):
+        raise InvalidRequest(
+            "refill_per_second must be a finite positive number no greater than 1000000")
+    if not 0 < rate <= 1_000_000:
+        raise InvalidRequest(
+            "refill_per_second must be a finite positive number no greater than 1000000")
     return Limit(int(capacity), float(rate))
 
 
