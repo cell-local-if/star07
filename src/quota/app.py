@@ -996,6 +996,101 @@ class Limiter:
                 "events": [event.as_json() for event in events[-event_limit:]],
             }
 
+    def reconciliation(self, key: Any) -> dict[str, Any]:
+        """The GET /v1/ledgers/{key}/reconciliation audit: cross-check one token-bucket key's
+        booked usage, ledger totals, retained/trimmed detail coverage and live (unconfirmed)
+        holds from one locked snapshot.
+
+        Unlike ledger() this read DOES settle, exactly the way every quota entry does: the clock
+        is sampled once inside the lock and clamped to the watermark, then every due hold of the
+        key — single-key and cross-layer alike — is settled at that one inclusive boundary before
+        anything is read. The settle only releases tokens (the ordinary _expire_due path): it
+        books no used, posts no ledger event and counts no decision, so the audit never changes
+        the history it reports and a second audit returns the same numbers with a stalled clock.
+        Windows and leaky buckets never enter the audit — their holds are not token holds and
+        their traffic never reaches a ledger.
+
+        The report is descriptive, never reparative: when used and the ledger disagree, when the
+        retained tail plus the trimmed prefix fail to cover the accepted totals, when the tail's
+        seq is broken, or when the tail does not end at accepted_count, reconciled is false and
+        the differences are returned — but no history is rewritten, back-filled or deleted.
+        """
+        key = validate_key(key)
+        with self._lock:
+            now = self._tick()
+            if key not in self._limits:
+                # Looked up after the single sample, exactly like state_snapshot does it, and the
+                # miss creates nothing: no ledger, no bucket, no reservation registry entries.
+                raise LimitNotFound(f"no limit configured for {key!r}")
+            # Settle due holds first (token release only), then read the post-settle snapshot:
+            # every hold still in the registries below is genuinely live at this moment.
+            self._expire_due(key, now)
+
+            bucket = self._buckets[key]
+            ledger = self._ledgers.get(key)
+            accepted_count = ledger.accepted_count if ledger is not None else 0
+            accepted_cost = ledger.accepted_cost if ledger is not None else 0
+            retained = list(ledger.events) if ledger is not None else []
+
+            retained_count = len(retained)
+            retained_cost = sum(event.cost for event in retained)
+            # The trimmed prefix is derived, never separately stored: whatever the dense lifetime
+            # ordinal and running total say the bounded tail no longer carries. The audit thus
+            # works even if detail and totals were somehow forced apart.
+            trimmed_count = accepted_count - retained_count
+            trimmed_cost = accepted_cost - retained_cost
+
+            single_holds = [reservation for reservation in self._reservations.values()
+                            if reservation.key == key]
+            hierarchy_holds = [reservation for reservation in self._hierarchy_reservations.values()
+                               if key in reservation.keys]
+            # A cross-layer hold is ONE hold on this key however many layers it also spans, so
+            # its cost counts toward active_cost exactly once here (per hold, not per layer).
+            active_cost = (sum(reservation.cost for reservation in single_holds)
+                           + sum(reservation.cost for reservation in hierarchy_holds))
+
+            # The retained tail is sound only when its seq runs densely with no gap or repeat.
+            seq_contiguous = all(retained[index].seq == retained[0].seq + index
+                                 for index in range(retained_count))
+            # Coverage holds when retained + the derived trimmed prefix exactly rebuilds the
+            # lifetime totals. The non-negativity guards are load-bearing under a damaged ledger
+            # (detail sum past the running total): then the derived trimmed amount is negative and
+            # the trim-total discrepancy must surface rather than cancel algebraically.
+            coverage_matches = (retained_count + trimmed_count == accepted_count
+                                and retained_cost + trimmed_cost == accepted_cost
+                                and trimmed_count >= 0 and trimmed_cost >= 0)
+            # null == null only for a genuinely empty history; a non-empty tail must end exactly
+            # at the lifetime count, so an emptied-but-booked ledger can never reconcile as true.
+            last_seq_value = retained[-1].seq if retained else None
+            last_matches_count = last_seq_value == (accepted_count if accepted_count else None)
+            reconciled = (bucket.used == accepted_cost and coverage_matches
+                          and seq_contiguous and last_matches_count)
+
+            return {
+                "key": key,
+                "reconciled": reconciled,
+                "usage": {
+                    "used": bucket.used,
+                    "ledger_accepted_count": accepted_count,
+                    "ledger_accepted_cost": accepted_cost,
+                    "used_minus_ledger_cost": bucket.used - accepted_cost,
+                },
+                "holds": {
+                    "active_count": len(single_holds) + len(hierarchy_holds),
+                    "active_cost": active_cost,
+                    "single_key_count": len(single_holds),
+                    "hierarchy_count": len(hierarchy_holds),
+                },
+                "events": {
+                    "retained_count": retained_count,
+                    "retained_cost": retained_cost,
+                    "trimmed_count": trimmed_count,
+                    "trimmed_cost": trimmed_cost,
+                    "first_seq": retained[0].seq if retained else None,
+                    "last_seq": retained[-1].seq if retained else None,
+                },
+            }
+
     def _expire_window(self, window: SlidingWindow, now: float) -> None:
         """Drop every window admission whose age has reached window_seconds at this effective moment.
 
@@ -1491,6 +1586,15 @@ def make_handler(limiter: Limiter) -> type[BaseHTTPRequestHandler]:
                 if len(parts) == 3 and parts[:2] == ["v1", "limits"]:
                     state, revision = limiter.state_snapshot(parts[2])
                     return self._send(200, state, {"ETag": etag_header(revision)})
+                if len(parts) == 4 and parts[:2] == ["v1", "ledgers"] and parts[3] == "reconciliation":
+                    # The audit takes neither query parameters nor a request body: the query is
+                    # rejected right after the route matches, before key validation or the lock,
+                    # so a bad query changes nothing (and GET never reads the body). No ETag is
+                    # ever sent: the audit is no configuration revision.
+                    if self._query_string() != "":
+                        raise InvalidRequest(
+                            "GET /v1/ledgers/{key}/reconciliation takes no query parameters")
+                    return self._send(200, limiter.reconciliation(parts[2]))
                 if len(parts) == 3 and parts[:2] == ["v1", "ledgers"]:
                     # Route matched first: query validation now beats the key's 404, just as body
                     # validation precedes quota classification everywhere else.

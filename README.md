@@ -193,6 +193,35 @@ PYTHONPATH=src python3 -m unittest discover -s tests -v
 - 未配置的 key ⇒ `404 not_found`；`events` 不是 1..1000 内的整数字面量、参数重复或出现任何未知查询参数
   ⇒ `400 invalid_request`（查询校验先于 key 的 404）；路径段数不对或方法不匹配 ⇒ `404 not_found`。
 
+### `GET /v1/ledgers/{key}/reconciliation`
+**只读核对**，交叉核对某个令牌桶 key 的已入账用量、账本总量、保留/裁剪明细覆盖与未确认预留。
+**不接受查询参数或请求体**（GET 本就不读体；带任意查询参数 ⇒ `400 invalid_request`，且不改变任何状态）。
+- **入口时钟与结算**：与其他额度入口相同，在锁内**只采样一次时钟**并按高水位线钳制，先按包含边界
+  （`expires_at <= now`，等号算到期）结算该 key 已到期的单键与跨层预留，再取**同一快照**出报告。
+  结算只释放令牌，**不增加 used、不写账本、不计 metrics、不改变 revision**；核对本身不补写、不修复任何历史。
+- 成功恒返回 **200**（不一致也 200），响应顶层**只含** `key`、`reconciled`、`usage`、`holds`、`events` 五个字段，
+  **不带 ETag**。
+- `usage` 固定为 `{"used": <int>, "ledger_accepted_count": <int>, "ledger_accepted_cost": <int>,
+  "used_minus_ledger_cost": <int>}`：`used` 取结算后桶的累计已接受用量；`used_minus_ledger_cost`
+  为二者之差（相等为 0，不等时如实给正/负差额）。
+- `holds` 固定为 `{"active_count": <int>, "active_cost": <int>, "single_key_count": <int>,
+  "hierarchy_count": <int>}`：统计**结算后仍存活**的未确认预留；`single_key_count` 为该 key 的单键预留数，
+  `hierarchy_count` 为触及该 key 的跨层预留数，`active_count` 为二者之和；一条跨层预留对该 key 只是一个 hold，
+  其 `cost` 在 `active_cost` 中**只计一次**（不按层数翻倍）。
+- `events` 固定为 `{"retained_count": <int>, "retained_cost": <int>, "trimmed_count": <int>,
+  "trimmed_cost": <int>, "first_seq": <int|null>, "last_seq": <int|null>}`：
+  `retained_*` 对**全部可读明细**（有界尾部的全部，最多 1000 条，不受账本接口默认 100 条窗口影响）计数计 cost；
+  `trimmed_*` 由 accepted 总量减去 retained 推导，表示已累计裁剪掉的前缀；空明细时 `first_seq`/`last_seq` 均为 `null`。
+  滑动窗口与漏桶**不进入核对**（其流量从不落令牌桶账本）。
+- **`reconciled` 为 `true` 当且仅当**：① `used == ledger_accepted_cost`；② 保留与裁剪的**数量**之和等于
+  `ledger_accepted_count`、**cost** 之和等于 `ledger_accepted_cost`（即 retained+trimmed 覆盖 accepted 总量）；
+  ③ 保留明细的 `seq` 从 `first_seq` 起**连续**（无跳号、无重复）；④ `last_seq == ledger_accepted_count`
+  （空明细时仅当 `ledger_accepted_count` 为 0，即 `null == null`）。任一条件不成立仍返回 **200** 与 `false`
+  及各项差额，**不补写历史**。
+- key 非法 ⇒ `400 invalid_request`；有查询参数 ⇒ `400 invalid_request`（路由匹配后立即判断，先于 key 查找与时钟采样，
+  故不推进水位线、不结算、不创建任何对象）；key 未配置 ⇒ `404 not_found`（**不创建**账本或桶对象）；
+  路径段数不对（如 `/v1/ledgers/k/reconciliation/extra`）或方法不匹配 ⇒ `404 not_found`。
+
 ### `PUT /v1/windows/{key}`
 与令牌桶**彼此独立**的精确滑动窗口限流：创建或更新窗口。请求体只接受
 `{"window_seconds": <int 1..3600>, "max_events": <int 1..1000000>}`（两者均须为非布尔整数，不允许缺省、
