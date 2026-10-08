@@ -181,6 +181,28 @@ class SlidingWindow:
     events: list[tuple[float, int]] = field(default_factory=list)
 
 
+@dataclass
+class WindowReservation:
+    """One capacity hold against a sliding window: `cost` of the window's max_events held live.
+
+    The hold counts towards used/remaining immediately on creation and settles without an
+    event: it is deleted at created_at + ttl_seconds (boundary inclusive), and rollback deletes
+    it immediately. A first consume moves it out of the hold registry and into the window's
+    ordinary event history stamped at the consume moment, so it then slides out by the normal
+    window_seconds rule; the confirmed response is stored verbatim for idempotent replays.
+    """
+
+    reservation_id: str
+    key: str
+    cost: int
+    created_at: float
+    ttl_seconds: int
+
+    def release_moment(self) -> float:
+        """The effective moment at which a live (never consumed) hold lapses: creation + ttl."""
+        return self.created_at + self.ttl_seconds
+
+
 @dataclass(frozen=True)
 class LeakyBucketConfig:
     """One leaky bucket: at most `capacity` accumulated water, leaking `leak_per_second`."""
@@ -431,6 +453,15 @@ class Limiter:
         # Independent sliding windows, keyed in their own namespace: a window named like a bucket
         # shares neither history nor accounting with it, and window admissions never touch a ledger.
         self._windows: dict[str, SlidingWindow] = {}
+        # Capacity holds against sliding windows, in a registry of their own (keyed by hold id,
+        # never by window key): a hold id never resolves through the token-bucket reservation
+        # endpoints and vice versa. A live hold contributes its cost to the window's used/remaining
+        # but, unlike a confirmed admission, never enters the window's event history: TTL expiry and
+        # rollback simply delete it (no event), and a first consume converts it into one ordinary
+        # (effective_at, cost) event. Confirmed holds leave the live registry for good and the value
+        # is the exact first consume response, replayed verbatim on retries (occupancy moves once).
+        self._window_reservations: dict[str, WindowReservation] = {}
+        self._window_reservations_consumed: dict[str, dict[str, Any]] = {}
         # Independent leaky buckets, likewise in their own namespace: a leaky bucket named like a
         # token bucket or window shares neither level nor configuration, and its traffic never
         # reaches a ledger, a revision or the five decision counters.
@@ -991,6 +1022,68 @@ class Limiter:
         """The live occupancy: the cost sum of every surviving admission."""
         return sum(cost for _, cost in window.events)
 
+    def _settle_window_reservations(self, key: str, now: float) -> None:
+        """Release every LIVE window hold on `key` whose created_at + ttl has reached this moment.
+
+        The boundary is inclusive (release_moment <= now), exactly like event eviction and the
+        token-bucket holds. A released hold simply leaves the registry and stops contributing to
+        occupancy: it produced no event on creation and its release produces none either, so its
+        cost vanishes from used rather than sliding out through the history. Confirmed holds are
+        not in this registry (their cost is already an ordinary event) and are never touched here.
+        Caller holds the lock and supplies the operation's single effective moment.
+        """
+        due = [rid for rid, hold in self._window_reservations.items()
+               if hold.key == key and hold.release_moment() <= now]
+        for rid in due:
+            del self._window_reservations[rid]
+
+    def _window_holds(self, key: str) -> list[WindowReservation]:
+        """Every live hold against `key`, ordered from the earliest release moment to the latest.
+
+        The order is only used to walk release moments oldest-first for a 429's Retry-After; holds
+        sharing a release moment free together as one batch, exactly like same-moment events.
+        """
+        holds = [hold for hold in self._window_reservations.values() if hold.key == key]
+        holds.sort(key=lambda hold: hold.release_moment())
+        return holds
+
+    def _window_held(self, key: str) -> int:
+        """The cost currently held by live window reservations on `key` (TTL settled by caller)."""
+        return sum(hold.cost for hold in self._window_reservations.values() if hold.key == key)
+
+    def _window_over_quota(self, window: SlidingWindow, key: str, now: float,
+                           used: int, cost: int) -> OverQuota:
+        """Build the window 429 for a `cost` that does not currently fit.
+
+        Room frees at two kinds of moment, considered on one merged timeline from the earliest
+        future release: surviving event batches leave at event_moment + window_seconds (they free
+        their cumulative cost sum) and live holds lapse at created_at + ttl_seconds (they free
+        their held cost). Walk both oldest-first as one stream — every release sharing a moment
+        frees together as one batch — accumulating released cost until used - released + cost first
+        fits max_events; the Retry-After ends at that batch's moment, ceiled to milliseconds by the
+        HTTP layer. Always reaches a sufficient batch because cost <= max_events was established by
+        the caller (the current event batch alone eventually frees the whole history).
+        """
+        config = window.config
+        event_pops = [(moment + config.window_seconds, event_cost)
+                      for moment, event_cost in window.events]
+        release_pops = [(hold.release_moment(), hold.cost) for hold in self._window_holds(key)]
+        pops = event_pops + release_pops
+        pops.sort(key=lambda pop: pop[0])
+        released = 0
+        index = 0
+        while index < len(pops):
+            batch_moment = pops[index][0]
+            while index < len(pops) and pops[index][0] == batch_moment:
+                released += pops[index][1]
+                index += 1
+            if used - released + cost <= config.max_events:
+                break
+        retry_after = batch_moment - now
+        return OverQuota(
+            f"window for {key!r} is full: {used}/{config.max_events} used, needs {cost}",
+            retry_after)
+
     def configure_window(self, key: Any, payload: Any) -> WindowConfig:
         """Create or replace a window's configuration while keeping its admitted history.
 
@@ -1009,13 +1102,21 @@ class Limiter:
             else:
                 window.config = config
                 self._expire_window(window, now)
+                # Like the token-bucket reconfigure, settle this key's due holds at the same
+                # effective moment: a live hold keeps occupying under the new config (lowering
+                # max_events never revokes it), but a hold already at created_at + ttl is released
+                # here rather than lingering until the next check/read. The TTL itself is unchanged.
+                self._settle_window_reservations(key, now)
         return config
 
     def window_state(self, key: Any) -> dict[str, Any]:
         """The same {window, used, remaining} snapshot a cost-1 check at this effective moment would see.
 
-        used is the surviving admissions' cost SUM, not their count; remaining is max_events minus
-        that sum (and may be negative when max_events was lowered below the live occupancy).
+        used is the surviving admissions' cost SUM plus every LIVE reservation's held cost, not a
+        count; remaining is max_events minus that sum (and may be negative when max_events was
+        lowered below the live occupancy). Due holds are settled first, exactly as every window
+        entry settles, so a hold past created_at + ttl no longer occupies anything and its release
+        forms no event.
         """
         key = validate_key(key)
         with self._lock:
@@ -1024,7 +1125,8 @@ class Limiter:
             if window is None:
                 raise LimitNotFound(f"no window configured for {key!r}")
             self._expire_window(window, now)
-            used = self._window_used(window)
+            self._settle_window_reservations(key, now)
+            used = self._window_used(window) + self._window_held(key)
             return {"window": window.config.as_json(), "used": used,
                     "remaining": window.config.max_events - used}
 
@@ -1042,13 +1144,15 @@ class Limiter:
 
         After that single sample, every admission whose effective_at plus window_seconds has
         reached this moment (the boundary is inclusive, and same-moment admissions leave together
-        as one batch) is dropped. The live used is the surviving cost sum. When used + cost <=
-        max_events the cost is admitted at this single effective moment and the returned used
-        already includes it; otherwise the cost enters no history, one over_quota decision is
-        counted, and Retry-After is the wait until the oldest same-moment batch whose cumulative
-        released cost first makes room for this request frees enough capacity — i.e. until that
-        batch's moment + window_seconds, which every concurrent reject at this moment computes
-        identically. cost exactly equal to max_events fits an otherwise empty window.
+        as one batch) is dropped, and every live reservation whose TTL has reached this moment is
+        released the same way. The live used is the surviving cost sum plus the live reservations'
+        held cost. When used + cost <= max_events the cost is admitted at this single effective
+        moment and the returned used already includes it; otherwise the cost enters no history,
+        one over_quota decision is counted, and Retry-After is the wait until the earliest release
+        batch on the merged timeline of expiring admissions (event moment + window_seconds) and
+        lapsing reservations (created_at + ttl_seconds) whose cumulative freed cost first makes
+        room for this request — every concurrent reject at this moment computes it identically.
+        cost exactly equal to max_events fits an otherwise empty window.
         """
         key = validate_key(key)
         cost = validate_cost(cost)
@@ -1069,34 +1173,144 @@ class Limiter:
             if window is None:
                 raise LimitNotFound(f"no window configured for {key!r}")
             self._expire_window(window, now)
+            self._settle_window_reservations(key, now)
             config = window.config
-            used = self._window_used(window)
+            held = self._window_held(key)
+            used = self._window_used(window) + held
             if used + cost <= config.max_events:
                 window.events.append((now, cost))
                 self._record_decision("window_check", "allowed")
                 used += cost
                 return {"allowed": True, "used": used, "remaining": config.max_events - used,
                         "limit": config.max_events, "window_seconds": config.window_seconds}
-            # Over quota: walk the surviving admissions oldest-first, batching same-moment entries
-            # (they leave together) and accumulating released cost until dropping this batch opens
-            # enough room; the wait ends at that batch's leave moment. Events are timestamp-sorted
-            # by admission construction, and the loop always reaches a sufficient batch because
-            # cost <= max_events was established above.
-            released = 0
-            index = 0
-            events = window.events
-            while index < len(events):
-                batch_moment = events[index][0]
-                while index < len(events) and events[index][0] == batch_moment:
-                    released += events[index][1]
-                    index += 1
-                if used - released + cost <= config.max_events:
-                    break
-            retry_after = batch_moment + config.window_seconds - now
+            # Over quota: room frees on one merged timeline of surviving event batches (they leave
+            # at moment + window_seconds) and live reservations (they lapse at created_at +
+            # ttl_seconds); _window_over_quota walks both oldest-first, batching equal moments, to
+            # the first cumulative release that makes room for this request. Events are
+            # timestamp-sorted by admission construction, and the loop always reaches a sufficient
+            # batch because cost <= max_events was established above.
             self._record_decision("window_check", "over_quota")
-            raise OverQuota(
-                f"window for {key!r} is full: {used}/{config.max_events} used, needs {cost}",
-                retry_after)
+            raise self._window_over_quota(window, key, now, used, cost)
+
+    def window_reserve(self, key: Any, cost: Any = 1,
+                       ttl_seconds: Any = DEFAULT_TTL_SECONDS) -> dict[str, Any]:
+        """Hold `cost` of a window's capacity without admitting an event.
+
+        `cost` and `ttl_seconds` follow the shared rules (non-boolean ints, cost 1..1000000,
+        ttl 1..86400), validated with the key before the lock. Inside the one critical section a
+        legal cost above a CONFIGURED window's CURRENT max_events is rejected as invalid_request
+        before the clock is sampled — such a hold can never fit however long the caller waits, so
+        the rejection advances no watermark, evicts no admission, releases no hold and counts no
+        decision. An unknown window has no max_events to compare against and keeps the 404 (the
+        clock is sampled exactly as on window_check and the lookup never creates one).
+
+        After that single sample, due events are evicted and due holds released at this moment.
+        The live used is surviving events plus live holds. When used + cost <= max_events the hold
+        is created at this moment and contributes its cost to used/remaining at once; it enters NO
+        event history and is not a window_check decision (window reservations never touch the five
+        decision counters). Otherwise nothing is held and the 429's Retry-After waits on the merged
+        timeline of expiring events and lapsing holds, exactly as window_check computes it.
+        """
+        key = validate_key(key)
+        cost = validate_cost(cost)
+        ttl_seconds = validate_ttl(ttl_seconds)
+        with self._lock:
+            # Same pre-sample unsatisfiable boundary as window_check: a legal cost above the
+            # window's CURRENT max_events is 400 invalid_request with no watermark advance, no
+            # eviction, no hold release, no occupancy change and no metric. An unknown window
+            # keeps 404 (sampled exactly as on window_check; never created here).
+            window = self._windows.get(key)
+            if window is not None and cost > window.config.max_events:
+                raise InvalidRequest(
+                    f"cost {cost} exceeds max_events {window.config.max_events} for key {key!r}")
+            now = self._tick()
+            if window is None:
+                raise LimitNotFound(f"no window configured for {key!r}")
+            self._expire_window(window, now)
+            self._settle_window_reservations(key, now)
+            config = window.config
+            used = self._window_used(window) + self._window_held(key)
+            if used + cost > config.max_events:
+                raise self._window_over_quota(window, key, now, used, cost)
+            hold = WindowReservation(uuid.uuid4().hex, key, cost, now, ttl_seconds)
+            self._window_reservations[hold.reservation_id] = hold
+            used += cost
+            return {"reservation_id": hold.reservation_id, "key": key, "cost": cost,
+                    "used": used, "remaining": config.max_events - used,
+                    "limit": config.max_events, "window_seconds": config.window_seconds,
+                    "ttl_seconds": ttl_seconds}
+
+    def window_rollback(self, key: Any, reservation_id: str) -> dict[str, Any]:
+        """Release a live window hold once, immediately: its cost stops occupying the window.
+
+        The path supplies the window key, so a hold belonging to another window never resolves
+        here: unknown window, unknown id, id held against a different key, an already-consumed or
+        expired hold, and a repeated rollback are all 404 not_found. The clock is sampled once and
+        due holds settle first, so a hold at or past created_at + ttl is already gone. Rollback
+        writes no event, changes no revision/ETag and counts no decision.
+        """
+        key = validate_key(key)
+        with self._lock:
+            now = self._tick()
+            window = self._windows.get(key)
+            if window is None:
+                raise LimitNotFound(f"no window configured for {key!r}")
+            self._expire_window(window, now)
+            self._settle_window_reservations(key, now)
+            hold = self._window_reservations.get(reservation_id)
+            if hold is None or hold.key != key:
+                # A live id that merely belongs to another window is not this window's hold: leave
+                # its registry entry untouched and answer 404.
+                raise LimitNotFound(f"no rollbackable window reservation {reservation_id!r}")
+            del self._window_reservations[reservation_id]
+            config = window.config
+            used = self._window_used(window) + self._window_held(key)
+            # The common six fields plus the single rollback marker: the id lives in the path and
+            # is not echoed back (only creation returns a reservation_id).
+            return {"key": key, "cost": hold.cost,
+                    "used": used, "remaining": config.max_events - used,
+                    "limit": config.max_events, "window_seconds": config.window_seconds,
+                    "rolled_back": True}
+
+    def window_consume(self, key: Any, reservation_id: str) -> dict[str, Any]:
+        """Confirm a live window hold as one ordinary window admission, exactly once.
+
+        The hold's cost already occupied the window from creation; consume does not occupy it a
+        second time. At the single effective moment due events are evicted and due holds released,
+        then the live hold is removed from the hold registry and its cost becomes one ordinary
+        (effective_at, cost) event stamped NOW, so it slides out by window_seconds from the consume
+        moment rather than waiting out the creation TTL. The net occupancy is unchanged by the
+        conversion; shortening window_seconds afterwards can evict the new event like any other.
+        Repeating the call replays the first response verbatim and adds no event; an unknown
+        window, unknown or cross-key id, or an expired/rolled-back hold is 404 and never books.
+        """
+        key = validate_key(key)
+        with self._lock:
+            now = self._tick()
+            snapshot = self._window_reservations_consumed.get(reservation_id)
+            if snapshot is not None and snapshot["key"] == key:
+                return dict(snapshot)
+            window = self._windows.get(key)
+            if window is None:
+                raise LimitNotFound(f"no window configured for {key!r}")
+            self._expire_window(window, now)
+            self._settle_window_reservations(key, now)
+            hold = self._window_reservations.get(reservation_id)
+            if hold is None or hold.key != key:
+                raise LimitNotFound(f"no consumable window reservation {reservation_id!r}")
+            del self._window_reservations[reservation_id]
+            config = window.config
+            # Convert the hold into an ordinary admission stamped now: held cost leaves the hold
+            # registry and the same cost enters the event history, so total occupancy is unchanged.
+            window.events.append((now, hold.cost))
+            used = self._window_used(window) + self._window_held(key)
+            # The common six fields plus the single consumed marker (no reservation_id echoed).
+            snapshot = {"key": key, "cost": hold.cost,
+                        "used": used, "remaining": config.max_events - used,
+                        "limit": config.max_events, "window_seconds": config.window_seconds,
+                        "consumed": True}
+            self._window_reservations_consumed[reservation_id] = snapshot
+            return dict(snapshot)
 
     def _leak(self, bucket: LeakyBucket, now: float) -> LeakyBucket:
         """Drain one leaky bucket at its CURRENT rate for the wait since its last effective moment.
@@ -1419,6 +1633,28 @@ def make_handler(limiter: Limiter) -> type[BaseHTTPRequestHandler]:
                         raise InvalidRequest('body must be {} or {"cost": <integer>}')
                     result = limiter.window_check(parts[2], body.get("cost", 1))
                     return self._send(200, result)
+                if len(parts) == 4 and parts[:2] == ["v1", "windows"] and parts[3] == "reservations":
+                    # Window capacity-hold creation: the key rides in the path, so the body is an
+                    # object carrying at most cost and ttl_seconds; {} means the defaults 1 and 60.
+                    # Anything else — arrays, scalars, unknown fields, malformed JSON — is
+                    # invalid_request before the lock, mirroring the window check body exactly.
+                    body = self._read_json()
+                    if not isinstance(body, dict) or set(body) - {"cost", "ttl_seconds"}:
+                        raise InvalidRequest(
+                            'body must be {} or {"cost": <integer>, "ttl_seconds": <integer>}')
+                    ttl = body.get("ttl_seconds", DEFAULT_TTL_SECONDS)
+                    result = limiter.window_reserve(parts[2], body.get("cost", 1), ttl)
+                    return self._send(200, result)
+                if len(parts) == 6 and parts[:2] == ["v1", "windows"] \
+                        and parts[3] == "reservations" and parts[5] == "consume":
+                    # Confirming a window hold takes the same empty-object body as every other
+                    # consume route: a present, non-empty or non-object body is invalid_request,
+                    # while a wrong shape to an unmatched path stays a body-unread 404.
+                    body = self._read_json()
+                    if not isinstance(body, dict) or body:
+                        raise InvalidRequest('body must be an empty JSON object {}')
+                    result = limiter.window_consume(parts[2], parts[4])
+                    return self._send(200, result)
                 if len(parts) == 4 and parts[:2] == ["v1", "leaky-buckets"] and parts[3] == "check":
                     # No query parameters on this route either: reject before reading the body.
                     if self._query_string() != "":
@@ -1451,6 +1687,12 @@ def make_handler(limiter: Limiter) -> type[BaseHTTPRequestHandler]:
                     return self._send(200, result)
                 if len(parts) == 4 and parts[:3] == ["v1", "hierarchies", "reservations"]:
                     result = limiter.hierarchy_rollback(parts[3])
+                    return self._send(200, result)
+                if len(parts) == 5 and parts[:2] == ["v1", "windows"] \
+                        and parts[3] == "reservations":
+                    # Rolling back a window hold: the window key scopes the id, so an id held by
+                    # another window (along with unknown/expired/consumed ids) is 404.
+                    result = limiter.window_rollback(parts[2], parts[4])
                     return self._send(200, result)
                 return self._send(404, {"error": {"code": "not_found"}})
             except QuotaError as error:
